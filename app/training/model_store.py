@@ -23,9 +23,9 @@ def replace_current_model(
     residual_intervals: dict[str, dict[str, float]],
 ) -> None:
     try:
-        stored_path = str(artifact_path.resolve().relative_to(SERVICE_ROOT.resolve()))
+        stored_path = artifact_path.resolve().relative_to(SERVICE_ROOT.resolve()).as_posix()
     except ValueError:
-        stored_path = str(artifact_path.resolve())
+        stored_path = artifact_path.resolve().as_posix()
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -58,5 +58,5 @@ def get_current_model(connection: Connection) -> dict[str, Any] | None:
 
 
 def resolve_artifact_path(stored_path: str) -> Path:
-    path = Path(stored_path)
+    path = Path(stored_path.replace("\\", "/"))
     return path if path.is_absolute() else SERVICE_ROOT / path
