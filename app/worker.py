@@ -34,11 +34,26 @@ def run_forever() -> None:
         logging.info("Forecast run result: %s", json.dumps(result, ensure_ascii=False))
 
 
+def ensure_model_artifact() -> None:
+    artifact_path = get_settings().ARTIFACTS_DIR / "current" / "gas_forecast.joblib"
+    if artifact_path.is_file():
+        return
+
+    logging.info("Model artifact is missing at %s; starting initial training", artifact_path)
+    from app.training.train import train_and_replace
+
+    result = train_and_replace()
+    logging.info("Initial training result: %s", json.dumps(result, ensure_ascii=False))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hourly gas forecast worker.")
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--train-if-missing", action="store_true")
     parser.add_argument("--cutoff", help="Optional ISO-8601 data cutoff for a one-shot run.")
     args = parser.parse_args()
+    if args.train_if_missing:
+        ensure_model_artifact()
     if args.once:
         cutoff = datetime.fromisoformat(args.cutoff) if args.cutoff else None
         if cutoff is not None and cutoff.tzinfo is None:
