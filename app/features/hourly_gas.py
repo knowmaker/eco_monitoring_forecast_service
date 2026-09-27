@@ -41,6 +41,26 @@ DO UPDATE SET
     samples_count = EXCLUDED.samples_count,
     refreshed_at = NOW()
 """
+NORMALIZE_STORED_VALUES_SQL = """
+UPDATE public.gas_hourly_features
+SET raw_hourly_mean = ABS(raw_hourly_mean),
+    raw_hourly_median = ABS(raw_hourly_median),
+    filtered_hourly_mean = ABS(filtered_hourly_mean),
+    hourly_min = CASE
+        WHEN hourly_min <= 0 AND hourly_max >= 0 THEN 0
+        ELSE LEAST(ABS(hourly_min), ABS(hourly_max))
+    END,
+    hourly_max = GREATEST(ABS(hourly_min), ABS(hourly_max)),
+    hourly_p95 = ABS(hourly_p95),
+    hourly_std = ABS(hourly_std)
+WHERE raw_hourly_mean < 0
+   OR raw_hourly_median < 0
+   OR filtered_hourly_mean < 0
+   OR hourly_min < 0
+   OR hourly_max < 0
+   OR hourly_p95 < 0
+   OR hourly_std < 0
+"""
 
 
 def _raw_gas_frame(
@@ -99,6 +119,8 @@ def build_hourly_features(raw: pd.DataFrame, timezone_name: str) -> pd.DataFrame
         return pd.DataFrame()
 
     frame = raw.copy().sort_values(["monitoring_post_id", "substance_code", "timestamp"])
+    frame["value"] = pd.to_numeric(frame["value"], errors="coerce").abs()
+    frame = frame.dropna(subset=["value"])
     filtered = pd.Series(index=frame.index, dtype=float)
     for _, indices in frame.groupby(["monitoring_post_id", "substance_code"], sort=False).groups.items():
         filtered.loc[indices] = _causal_median_by_continuous_segment(frame.loc[indices])
@@ -156,6 +178,7 @@ def refresh_hourly_gas_features(
         return 0
     with connection.cursor() as cursor:
         cursor.executemany(UPSERT_SQL, list(_database_rows(hourly)))
+        cursor.execute(NORMALIZE_STORED_VALUES_SQL)
     return len(hourly)
 
 

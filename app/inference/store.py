@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from psycopg import Connection
 
@@ -58,3 +58,32 @@ def mark_rows(connection: Connection, rows, status: str, error_message: str | No
             status=status,
             error_message=error_message,
         )
+
+
+def remove_predictions_without_latest_measurement(
+    connection: Connection,
+    substance_code: str,
+    data_cutoff: datetime,
+) -> int:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM public.gas_predictions AS prediction
+            WHERE prediction.substance_code = %s
+              AND prediction.target_start = %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM public.gas_hourly_features AS feature
+                  WHERE feature.monitoring_post_id = prediction.monitoring_post_id
+                    AND feature.substance_code = prediction.substance_code
+                    AND feature.bucket_start = %s
+                    AND feature.filtered_hourly_mean IS NOT NULL
+              )
+            """,
+            (
+                substance_code,
+                data_cutoff + timedelta(hours=1),
+                data_cutoff - timedelta(hours=1),
+            ),
+        )
+        return cursor.rowcount

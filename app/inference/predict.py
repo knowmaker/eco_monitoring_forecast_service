@@ -8,9 +8,27 @@ from app.config import get_settings
 from app.db import db_connection
 from app.features.local_features import inference_rows_for_cutoff
 from app.features.spatial_features import add_spatial_features
-from app.inference.store import mark_rows, set_prediction_status
+from app.inference.store import (
+    mark_rows,
+    remove_predictions_without_latest_measurement,
+    set_prediction_status,
+)
 from app.models.base import load_artifact, prediction_results
 from app.training.model_store import get_current_model, resolve_artifact_path
+
+
+def _eligible_prediction_rows(
+    history: pd.DataFrame,
+    substance_code: str,
+    cutoff: datetime,
+) -> pd.DataFrame:
+    current_value_column = f"gas_{substance_code}_lag_0"
+    if history.empty or current_value_column not in history:
+        return history.iloc[0:0].copy()
+    return history[
+        (history["data_cutoff"] == cutoff)
+        & history[current_value_column].notna()
+    ].reset_index(drop=True)
 
 
 def predict_all_stations(cutoff: datetime) -> dict[str, int]:
@@ -19,10 +37,11 @@ def predict_all_stations(cutoff: datetime) -> dict[str, int]:
     with db_connection() as connection:
         frames: list[pd.DataFrame] = []
         for substance_code in get_settings().active_gases:
+            remove_predictions_without_latest_measurement(connection, substance_code, cutoff)
             history = add_spatial_features(
                 inference_rows_for_cutoff(connection, substance_code, cutoff), substance_code
             )
-            rows = history[history["data_cutoff"] == cutoff].reset_index(drop=True)
+            rows = _eligible_prediction_rows(history, substance_code, cutoff)
             if not rows.empty:
                 frames.append(rows)
         if not frames:

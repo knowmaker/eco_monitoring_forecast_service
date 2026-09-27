@@ -22,6 +22,13 @@ META_COLUMNS = {
     "target_value",
     "substance_code",
 }
+ABSOLUTE_GAS_COLUMNS = (
+    "raw_hourly_mean",
+    "raw_hourly_median",
+    "filtered_hourly_mean",
+    "hourly_p95",
+    "hourly_std",
+)
 
 
 def load_hourly_gas_features(
@@ -62,6 +69,17 @@ def load_hourly_gas_features(
     if frame.empty:
         return frame
     frame["bucket_start"] = pd.to_datetime(frame["bucket_start"], utc=True)
+    for column in ABSOLUTE_GAS_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").abs()
+    stored_minimum = pd.to_numeric(frame["hourly_min"], errors="coerce")
+    stored_maximum = pd.to_numeric(frame["hourly_max"], errors="coerce")
+    crosses_zero = (stored_minimum <= 0) & (stored_maximum >= 0)
+    frame["hourly_min"] = np.where(
+        crosses_zero,
+        0.0,
+        np.minimum(stored_minimum.abs(), stored_maximum.abs()),
+    )
+    frame["hourly_max"] = np.maximum(stored_minimum.abs(), stored_maximum.abs())
     return frame
 
 

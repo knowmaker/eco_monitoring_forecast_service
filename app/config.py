@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     OPEN_METEO_FORECAST_URL: str = "https://api.open-meteo.com/v1/forecast"
     OPEN_METEO_HISTORICAL_FORECAST_URL: str = "https://historical-forecast-api.open-meteo.com/v1/forecast"
     OPEN_METEO_TIMEOUT_SECONDS: int = Field(default=30, ge=5, le=120)
+    GRID_CELL_METERS: int = Field(default=100, ge=25, le=500)
+    GRID_BUFFER_METERS: int = Field(default=1000, ge=100, le=5000)
+    GRID_CLUSTER_DISTANCE_METERS: int = Field(default=5000, ge=500, le=50000)
+    GRID_MIN_STATIONS: int = Field(default=1, ge=1, le=20)
+    GRID_MAX_ADVECTION_METERS: int = Field(default=1000, ge=0, le=10000)
+    GRID_TRANSPORT_BLEND: float = Field(default=0.25, ge=0, le=1)
+    GRID_RETENTION_DAYS: int = Field(default=14, ge=1, le=366)
 
     @property
     def active_gases(self) -> tuple[str, ...]:

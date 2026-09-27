@@ -73,4 +73,31 @@ CREATE TABLE public.gas_predictions (
 CREATE INDEX idx_forecast_predictions_heatmap
     ON public.gas_predictions (substance_code, target_start DESC, monitoring_post_id);
 
+CREATE TABLE public.gas_concentration_grid (
+    substance_code TEXT NOT NULL,
+    hour_start TIMESTAMPTZ NOT NULL,
+    data_kind TEXT NOT NULL CHECK (data_kind IN ('observed', 'forecast')),
+    cluster_id BIGINT NOT NULL,
+    grid_x INTEGER NOT NULL,
+    grid_y INTEGER NOT NULL,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    south DOUBLE PRECISION NOT NULL,
+    west DOUBLE PRECISION NOT NULL,
+    north DOUBLE PRECISION NOT NULL,
+    east DOUBLE PRECISION NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    lower_bound DOUBLE PRECISION,
+    upper_bound DOUBLE PRECISION,
+    confidence DOUBLE PRECISION NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    source_station_count INTEGER NOT NULL CHECK (source_station_count >= 1),
+    wind_speed DOUBLE PRECISION,
+    wind_direction DOUBLE PRECISION,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (substance_code, hour_start, data_kind, cluster_id, grid_x, grid_y)
+);
+
+CREATE INDEX idx_gas_concentration_grid_timeline
+    ON public.gas_concentration_grid (substance_code, hour_start DESC, data_kind);
+
 COMMIT;
