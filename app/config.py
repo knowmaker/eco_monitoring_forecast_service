@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     GRID_MIN_STATIONS: int = Field(default=1, ge=1, le=20)
     GRID_MAX_ADVECTION_METERS: int = Field(default=1500, ge=0, le=10000)
     GRID_TRANSPORT_BLEND: float = Field(default=0.25, ge=0, le=1)
+    GRID_MIN_CONFIDENCE: float = Field(default=0.04, ge=0, le=1)
     GRID_RETENTION_DAYS: int = Field(default=7, ge=1, le=366)
     PHYSICS_TIME_STEP_SECONDS: int = Field(default=3600, ge=60, le=3600)
     PHYSICS_MAX_ADVECTION_METERS: int = Field(default=1500, ge=100, le=20000)
@@ -45,6 +46,8 @@ class Settings(BaseSettings):
     PHYSICS_MIN_DIFFUSIVITY_M2_S: float = Field(default=4.0, gt=0, le=500)
     PHYSICS_MAX_DIFFUSIVITY_M2_S: float = Field(default=40.0, gt=0, le=1000)
     PHYSICS_CORRECTION_RADIUS_METERS: int = Field(default=700, ge=100, le=5000)
+    PHYSICS_CONFIDENCE_RETENTION_PER_HOUR: float = Field(default=0.65, gt=0, le=1)
+    PHYSICS_MIN_CONCENTRATION: float = Field(default=0.000001, ge=0)
 
     @property
     def active_gases(self) -> tuple[str, ...]:

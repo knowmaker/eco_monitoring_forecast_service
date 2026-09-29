@@ -169,3 +169,43 @@ def test_semiphysical_forecast_stores_physical_and_statistical_components():
     assert (forecast["diffusion_coefficient"] > 0).all()
     assert (forecast["decay_coefficient"] > 0).all()
     assert (forecast["value"] >= 0).all()
+
+
+def test_analysis_preserves_previous_forecast_footprint():
+    anchors = _anchors().iloc[:1].copy()
+    initial_analysis = assimilate_observations(anchors, None)
+    prior_forecast = build_semiphysical_forecast_grid(
+        initial_analysis,
+        anchors,
+        substance_code="NO2",
+        wind_speed=4.0,
+        wind_from_degrees=270.0,
+    )
+
+    next_analysis = assimilate_observations(anchors, prior_forecast)
+
+    assert next_analysis["east"].max() >= prior_forecast["east"].max() - 0.0001
+    assert next_analysis["east"].max() > initial_analysis["east"].max()
+
+
+def test_transport_expands_footprint_across_successive_hours():
+    anchors = _anchors().iloc[:1].copy()
+    first_analysis = assimilate_observations(anchors, None)
+    first_forecast = build_semiphysical_forecast_grid(
+        first_analysis,
+        anchors,
+        substance_code="NO2",
+        wind_speed=4.0,
+        wind_from_degrees=270.0,
+    )
+    second_analysis = assimilate_observations(anchors, first_forecast)
+    second_forecast = build_semiphysical_forecast_grid(
+        second_analysis,
+        anchors,
+        substance_code="NO2",
+        wind_speed=4.0,
+        wind_from_degrees=270.0,
+    )
+
+    assert second_forecast["east"].max() > first_forecast["east"].max()
+    assert second_forecast["confidence"].between(0.0, 1.0).all()

@@ -302,7 +302,11 @@ def _interpolate_cluster(
             grid_y[:, None] - (source_y + wind_y * displacement)[None, :],
         )
         inside_coverage |= transported_distances.min(axis=1) <= buffer
-    keep = np.isfinite(values) & (confidence >= 0.04) & inside_coverage
+    keep = (
+        np.isfinite(values)
+        & (confidence >= settings.GRID_MIN_CONFIDENCE)
+        & inside_coverage
+    )
     grid_x = grid_x[keep]
     grid_y = grid_y[keep]
     values = values[keep]
@@ -445,14 +449,26 @@ def assimilate_observations(
     if prior_grid is None or prior_grid.empty:
         return analysis
 
-    radius = float(get_settings().PHYSICS_ASSIMILATION_RADIUS_METERS)
-    for cluster_id, indexes in analysis.groupby("cluster_id", sort=False).groups.items():
-        output = analysis.loc[indexes]
+    settings = get_settings()
+    step = float(settings.GRID_CELL_METERS)
+    support_distance = step * 0.8
+    radius = float(settings.PHYSICS_ASSIMILATION_RADIUS_METERS)
+    frames: list[pd.DataFrame] = []
+    for cluster_id, output in analysis.groupby("cluster_id", sort=False):
+        output = output.reset_index(drop=True)
         cluster_prior = prior_grid[prior_grid["cluster_id"] == cluster_id]
         if cluster_prior.empty:
+            frames.append(output)
             continue
-        reference_latitude = float(output["latitude"].mean())
-        reference_longitude = float(output["longitude"].mean())
+
+        reference_latitude = float(pd.concat(
+            (output["latitude"], cluster_prior["latitude"]),
+            ignore_index=True,
+        ).mean())
+        reference_longitude = float(pd.concat(
+            (output["longitude"], cluster_prior["longitude"]),
+            ignore_index=True,
+        ).mean())
         output_x, output_y = _project(
             output["latitude"].to_numpy(float), output["longitude"].to_numpy(float),
             reference_latitude, reference_longitude,
@@ -461,45 +477,144 @@ def assimilate_observations(
             cluster_prior["latitude"].to_numpy(float), cluster_prior["longitude"].to_numpy(float),
             reference_latitude, reference_longitude,
         )
+        x_min = np.floor(min(output_x.min(), prior_x.min()) / step) * step
+        x_max = np.ceil(max(output_x.max(), prior_x.max()) / step) * step
+        y_min = np.floor(min(output_y.min(), prior_y.min()) / step) * step
+        y_max = np.ceil(max(output_y.max(), prior_y.max()) / step) * step
+        x_values = np.arange(x_min, x_max + step, step)
+        y_values = np.arange(y_min, y_max + step, step)
+        mesh_x, mesh_y = np.meshgrid(x_values, y_values)
+        grid_x = mesh_x.ravel()
+        grid_y = mesh_y.ravel()
+
+        output_tree = cKDTree(np.column_stack((output_x, output_y)))
         prior_tree = cKDTree(np.column_stack((prior_x, prior_y)))
-        prior_distance, prior_index = prior_tree.query(np.column_stack((output_x, output_y)), k=1)
-        usable_prior = prior_distance <= float(get_settings().GRID_CELL_METERS) * 1.6
-        background = output["value"].to_numpy(float)
+        output_distance, output_index = output_tree.query(
+            np.column_stack((grid_x, grid_y)),
+            k=1,
+        )
+        prior_distance, prior_index = prior_tree.query(
+            np.column_stack((grid_x, grid_y)),
+            k=1,
+        )
+        usable_output = output_distance <= support_distance
+        usable_prior = prior_distance <= support_distance
+        keep = usable_output | usable_prior
+        grid_x = grid_x[keep]
+        grid_y = grid_y[keep]
+        output_index = output_index[keep]
+        prior_index = prior_index[keep]
+        usable_output = usable_output[keep]
+        usable_prior = usable_prior[keep]
+
+        output_values = output["value"].to_numpy(float)[output_index]
         prior_values = cluster_prior["value"].to_numpy(float)[prior_index]
-        background[usable_prior] = prior_values[usable_prior]
+        background = np.where(usable_prior, prior_values, output_values)
+        output_confidence = output["confidence"].to_numpy(float)[output_index]
+        prior_confidence = cluster_prior["confidence"].to_numpy(float)[prior_index]
+        confidence = np.maximum(
+            np.where(usable_output, output_confidence, 0.0),
+            np.where(usable_prior, prior_confidence, 0.0),
+        )
+
+        output_lower = output["lower_bound"].to_numpy(float)[output_index]
+        output_upper = output["upper_bound"].to_numpy(float)[output_index]
+        prior_lower = cluster_prior["lower_bound"].to_numpy(float)[prior_index]
+        prior_upper = cluster_prior["upper_bound"].to_numpy(float)[prior_index]
+        lower_bounds = np.where(usable_prior, prior_lower, output_lower)
+        upper_bounds = np.where(usable_prior, prior_upper, output_upper)
 
         all_anchor_x, all_anchor_y = _project(
             anchors["latitude"].to_numpy(float), anchors["longitude"].to_numpy(float),
             reference_latitude, reference_longitude,
         )
-        near_cluster = np.hypot(all_anchor_x, all_anchor_y) <= (
-            float(get_settings().GRID_CLUSTER_DISTANCE_METERS)
-            + float(get_settings().GRID_BUFFER_METERS)
+        anchor_distance, _ = output_tree.query(
+            np.column_stack((all_anchor_x, all_anchor_y)),
+            k=1,
         )
+        near_cluster = anchor_distance <= float(settings.GRID_BUFFER_METERS) + step * 2.0
         cluster_anchors = anchors.loc[near_cluster]
         if cluster_anchors.empty:
+            frames.append(output)
             continue
         station_x, station_y = _project(
             cluster_anchors["latitude"].to_numpy(float), cluster_anchors["longitude"].to_numpy(float),
             reference_latitude, reference_longitude,
         )
-        _, station_prior_index = prior_tree.query(np.column_stack((station_x, station_y)), k=1)
-        residuals = (
-            cluster_anchors["value"].to_numpy(float)
-            - cluster_prior["value"].to_numpy(float)[station_prior_index]
+        station_prior_distance, station_prior_index = prior_tree.query(
+            np.column_stack((station_x, station_y)),
+            k=1,
         )
+        station_values = cluster_anchors["value"].to_numpy(float)
+        estimated_at_stations = station_values.copy()
+        usable_station_prior = station_prior_distance <= step * 1.6
+        estimated_at_stations[usable_station_prior] = cluster_prior["value"].to_numpy(float)[
+            station_prior_index[usable_station_prior]
+        ]
+        residuals = station_values - estimated_at_stations
         distances = np.hypot(
-            output_x[:, None] - station_x[None, :],
-            output_y[:, None] - station_y[None, :],
+            grid_x[:, None] - station_x[None, :],
+            grid_y[:, None] - station_y[None, :],
         )
         weights = np.exp(-0.5 * (distances / radius) ** 2)
         correction = _weighted_values(weights, residuals)
         correction *= np.exp(-0.5 * (distances.min(axis=1) / radius) ** 2)
         corrected = np.maximum(background + correction, 0.0)
-        analysis.loc[indexes, "value"] = corrected
-        analysis.loc[indexes, "analysis_value"] = corrected
-        analysis.loc[indexes, "correction_value"] = correction
-    return analysis
+        lower_bounds = np.where(
+            np.isfinite(lower_bounds),
+            np.minimum(lower_bounds, corrected),
+            np.nan,
+        )
+        upper_bounds = np.where(
+            np.isfinite(upper_bounds),
+            np.maximum(upper_bounds, corrected),
+            np.nan,
+        )
+        latitudes, longitudes = _unproject(
+            grid_x,
+            grid_y,
+            reference_latitude,
+            reference_longitude,
+        )
+        south, west = _unproject(
+            grid_x - step / 2.0,
+            grid_y - step / 2.0,
+            reference_latitude,
+            reference_longitude,
+        )
+        north, east = _unproject(
+            grid_x + step / 2.0,
+            grid_y + step / 2.0,
+            reference_latitude,
+            reference_longitude,
+        )
+        frames.append(pd.DataFrame({
+            "cluster_id": int(cluster_id),
+            "grid_x": np.rint((grid_x - x_min) / step).astype(int),
+            "grid_y": np.rint((grid_y - y_min) / step).astype(int),
+            "latitude": latitudes,
+            "longitude": longitudes,
+            "south": south,
+            "west": west,
+            "north": north,
+            "east": east,
+            "value": corrected,
+            "analysis_value": corrected,
+            "physical_forecast": np.nan,
+            "correction_value": correction,
+            "lower_bound": lower_bounds,
+            "upper_bound": upper_bounds,
+            "confidence": confidence,
+            "source_station_count": len(cluster_anchors),
+            "wind_speed": wind_speed,
+            "wind_direction": wind_from_degrees,
+            "wind_u": wind_x * (float(wind_speed) if wind_speed is not None else 0.0),
+            "wind_v": wind_y * (float(wind_speed) if wind_speed is not None else 0.0),
+            "boundary_layer_height": np.nan,
+            "diffusion_coefficient": np.nan,
+            "decay_coefficient": np.nan,
+        }))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _deposit_bilinear(
@@ -633,13 +748,16 @@ def build_semiphysical_forecast_grid(
                 anchors["latitude"].to_numpy(float), anchors["longitude"].to_numpy(float),
                 reference_latitude, reference_longitude,
             )
+        buffer = float(settings.GRID_BUFFER_METERS)
         coverage_x = np.concatenate((
-            shifted_x,
+            shifted_x - buffer,
+            shifted_x + buffer,
             anchor_x - float(settings.GRID_BUFFER_METERS),
             anchor_x + float(settings.GRID_BUFFER_METERS),
         ))
         coverage_y = np.concatenate((
-            shifted_y,
+            shifted_y - buffer,
+            shifted_y + buffer,
             anchor_y - float(settings.GRID_BUFFER_METERS),
             anchor_y + float(settings.GRID_BUFFER_METERS),
         ))
@@ -663,7 +781,8 @@ def build_semiphysical_forecast_grid(
         )
         physical = gaussian_filter(physical, sigma=sigma_cells, mode="constant") * attenuation
         transported_confidence = np.clip(
-            gaussian_filter(transported_confidence, sigma=sigma_cells, mode="constant"),
+            gaussian_filter(transported_confidence, sigma=sigma_cells, mode="constant")
+            * settings.PHYSICS_CONFIDENCE_RETENTION_PER_HOUR,
             0.0,
             1.0,
         )
@@ -696,23 +815,25 @@ def build_semiphysical_forecast_grid(
             upper_bounds = np.full_like(physical_flat, np.nan)
 
         values = np.maximum(physical_flat + correction, 0.0)
-        confidence = np.maximum(transported_confidence.ravel(), anchor_confidence)
+        transported_confidence_flat = transported_confidence.ravel()
+        confidence = np.maximum(transported_confidence_flat, anchor_confidence)
         if anchor_x.size:
             station_distance = np.hypot(
                 flat_x[:, None] - anchor_x[None, :],
                 flat_y[:, None] - anchor_y[None, :],
             ).min(axis=1)
-            transported_distance = np.hypot(
-                flat_x[:, None] - (anchor_x + wind_x * displacement)[None, :],
-                flat_y[:, None] - (anchor_y + wind_y * displacement)[None, :],
-            ).min(axis=1)
-            rounded_coverage = (
-                (station_distance <= float(settings.GRID_BUFFER_METERS))
-                | (transported_distance <= float(settings.GRID_BUFFER_METERS))
-            )
+            station_coverage = station_distance <= buffer
         else:
-            rounded_coverage = np.ones_like(values, dtype=bool)
-        keep = np.isfinite(values) & (confidence >= 0.04) & rounded_coverage
+            station_coverage = np.zeros_like(values, dtype=bool)
+        transported_coverage = (
+            transported_confidence_flat >= settings.GRID_MIN_CONFIDENCE
+        )
+        significant_concentration = values >= settings.PHYSICS_MIN_CONCENTRATION
+        keep = (
+            np.isfinite(values)
+            & (confidence >= settings.GRID_MIN_CONFIDENCE)
+            & (station_coverage | (transported_coverage & significant_concentration))
+        )
         flat_x = flat_x[keep]
         flat_y = flat_y[keep]
         values = values[keep]
