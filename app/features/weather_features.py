@@ -23,6 +23,12 @@ WEATHER_COLUMNS = [
     "hor_win_spd",
     "precipitation",
     "cloud_cover",
+    "cloud_cover_low",
+    "wind_speed_100m",
+    "wind_direction_100m",
+    "wind_gusts_10m",
+    "boundary_layer_height",
+    "shortwave_radiation",
 ]
 OPEN_METEO_VARIABLES = [
     "temperature_2m",
@@ -32,6 +38,12 @@ OPEN_METEO_VARIABLES = [
     "wind_direction_10m",
     "precipitation",
     "cloud_cover",
+    "cloud_cover_low",
+    "wind_speed_100m",
+    "wind_direction_100m",
+    "wind_gusts_10m",
+    "boundary_layer_height",
+    "shortwave_radiation",
 ]
 
 
@@ -88,6 +100,12 @@ def _weather_rows(post_id: int, payload: dict[str, Any], data_kind: str) -> list
                 value("wind_direction_10m"),
                 value("precipitation"),
                 value("cloud_cover"),
+                value("cloud_cover_low"),
+                value("wind_speed_100m"),
+                value("wind_direction_100m"),
+                value("wind_gusts_10m"),
+                value("boundary_layer_height"),
+                value("shortwave_radiation"),
             )
         )
     return rows
@@ -103,8 +121,13 @@ def _upsert_weather(connection: Connection, rows: list[tuple[Any, ...]]) -> int:
                 monitoring_post_id, bucket_start, data_kind, provider,
                 model_latitude, model_longitude, air_temp, air_hum, atm_press,
                 hor_win_spd, hor_win_dir, precipitation, cloud_cover, fetched_at
+                , cloud_cover_low, wind_speed_100m, wind_direction_100m,
+                wind_gusts_10m, boundary_layer_height, shortwave_radiation
             )
-            VALUES (%s, %s, %s, 'open-meteo', %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            VALUES (
+                %s, %s, %s, 'open-meteo', %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                NOW(), %s, %s, %s, %s, %s, %s
+            )
             ON CONFLICT (monitoring_post_id, bucket_start, data_kind)
             DO UPDATE SET
                 provider = EXCLUDED.provider,
@@ -117,6 +140,12 @@ def _upsert_weather(connection: Connection, rows: list[tuple[Any, ...]]) -> int:
                 hor_win_dir = EXCLUDED.hor_win_dir,
                 precipitation = EXCLUDED.precipitation,
                 cloud_cover = EXCLUDED.cloud_cover,
+                cloud_cover_low = EXCLUDED.cloud_cover_low,
+                wind_speed_100m = EXCLUDED.wind_speed_100m,
+                wind_direction_100m = EXCLUDED.wind_direction_100m,
+                wind_gusts_10m = EXCLUDED.wind_gusts_10m,
+                boundary_layer_height = EXCLUDED.boundary_layer_height,
+                shortwave_radiation = EXCLUDED.shortwave_radiation,
                 fetched_at = NOW()
             """,
             rows,

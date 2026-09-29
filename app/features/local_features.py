@@ -21,6 +21,7 @@ META_COLUMNS = {
     "target_end",
     "target_value",
     "substance_code",
+    "correction_target",
 }
 ABSOLUTE_GAS_COLUMNS = (
     "raw_hourly_mean",
@@ -70,16 +71,11 @@ def load_hourly_gas_features(
         return frame
     frame["bucket_start"] = pd.to_datetime(frame["bucket_start"], utc=True)
     for column in ABSOLUTE_GAS_COLUMNS:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce").abs()
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").clip(lower=0.0)
     stored_minimum = pd.to_numeric(frame["hourly_min"], errors="coerce")
     stored_maximum = pd.to_numeric(frame["hourly_max"], errors="coerce")
-    crosses_zero = (stored_minimum <= 0) & (stored_maximum >= 0)
-    frame["hourly_min"] = np.where(
-        crosses_zero,
-        0.0,
-        np.minimum(stored_minimum.abs(), stored_maximum.abs()),
-    )
-    frame["hourly_max"] = np.maximum(stored_minimum.abs(), stored_maximum.abs())
+    frame["hourly_min"] = stored_minimum.clip(lower=0.0)
+    frame["hourly_max"] = stored_maximum.clip(lower=0.0)
     return frame
 
 
@@ -247,7 +243,14 @@ def build_local_frame(
             **{column: f"target_weather_{column}" for column in WEATHER_COLUMNS},
         }
     )
+    transport_weather = weather.rename(
+        columns={
+            "bucket_start": "data_cutoff",
+            **{column: f"transport_weather_{column}" for column in WEATHER_COLUMNS},
+        }
+    )
     frame = frame.merge(source_weather, on=["monitoring_post_id", "source_bucket"], how="left")
+    frame = frame.merge(transport_weather, on=["monitoring_post_id", "data_cutoff"], how="left")
     frame = frame.merge(target_weather, on=["monitoring_post_id", "target_start"], how="left")
     frame["substance_code"] = target_substance
     _add_time_features(frame)

@@ -55,7 +55,11 @@ def load_artifact(path: Path) -> ModelArtifact:
 def prediction_results(artifact: ModelArtifact, frame: pd.DataFrame) -> list[ForecastResult]:
     results: list[ForecastResult] = []
     intervals = artifact.metadata.get("residual_intervals", {})
-    for position, value in enumerate(artifact.predict(frame)):
+    predicted = artifact.predict(frame)
+    if artifact.metadata.get("prediction_mode") == "physical_residual":
+        baseline = pd.to_numeric(frame.get("physical_baseline"), errors="coerce").to_numpy(dtype=float)
+        predicted = baseline + predicted
+    for position, value in enumerate(predicted):
         code = str(frame.iloc[position].get("substance_code", ""))
         interval = intervals.get(code, {})
         residual_lower = interval.get("lower", artifact.residual_lower)

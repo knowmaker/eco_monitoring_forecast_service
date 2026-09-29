@@ -7,6 +7,7 @@ import pandas as pd
 from app.config import get_settings
 from app.db import db_connection
 from app.features.local_features import inference_rows_for_cutoff
+from app.features.physical_baseline import add_physical_baseline
 from app.features.spatial_features import add_spatial_features
 from app.inference.store import (
     mark_rows,
@@ -38,8 +39,10 @@ def predict_all_stations(cutoff: datetime) -> dict[str, int]:
         frames: list[pd.DataFrame] = []
         for substance_code in get_settings().active_gases:
             remove_predictions_without_latest_measurement(connection, substance_code, cutoff)
-            history = add_spatial_features(
-                inference_rows_for_cutoff(connection, substance_code, cutoff), substance_code
+            history = add_physical_baseline(
+                add_spatial_features(
+                    inference_rows_for_cutoff(connection, substance_code, cutoff), substance_code
+                )
             )
             rows = _eligible_prediction_rows(history, substance_code, cutoff)
             if not rows.empty:

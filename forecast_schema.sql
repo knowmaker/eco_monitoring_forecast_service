@@ -33,6 +33,12 @@ CREATE TABLE public.external_weather_hourly (
     hor_win_dir DOUBLE PRECISION,
     precipitation DOUBLE PRECISION,
     cloud_cover DOUBLE PRECISION,
+    cloud_cover_low DOUBLE PRECISION,
+    wind_speed_100m DOUBLE PRECISION,
+    wind_direction_100m DOUBLE PRECISION,
+    wind_gusts_10m DOUBLE PRECISION,
+    boundary_layer_height DOUBLE PRECISION,
+    shortwave_radiation DOUBLE PRECISION,
     fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (monitoring_post_id, bucket_start, data_kind)
 );
@@ -87,12 +93,20 @@ CREATE TABLE public.gas_concentration_grid (
     north DOUBLE PRECISION NOT NULL,
     east DOUBLE PRECISION NOT NULL,
     value DOUBLE PRECISION NOT NULL,
+    analysis_value DOUBLE PRECISION,
+    physical_forecast DOUBLE PRECISION,
+    correction_value DOUBLE PRECISION,
     lower_bound DOUBLE PRECISION,
     upper_bound DOUBLE PRECISION,
     confidence DOUBLE PRECISION NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
     source_station_count INTEGER NOT NULL CHECK (source_station_count >= 1),
     wind_speed DOUBLE PRECISION,
     wind_direction DOUBLE PRECISION,
+    wind_u DOUBLE PRECISION,
+    wind_v DOUBLE PRECISION,
+    boundary_layer_height DOUBLE PRECISION,
+    diffusion_coefficient DOUBLE PRECISION,
+    decay_coefficient DOUBLE PRECISION,
     generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (substance_code, hour_start, data_kind, cluster_id, grid_x, grid_y)
 );

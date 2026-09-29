@@ -1,6 +1,10 @@
 import pandas as pd
 
-from app.features.concentration_grid import build_concentration_grid
+from app.features.concentration_grid import (
+    assimilate_observations,
+    build_concentration_grid,
+    build_semiphysical_forecast_grid,
+)
 
 
 def _anchors() -> pd.DataFrame:
@@ -107,13 +111,42 @@ def test_forecast_grid_uses_predictions_when_recent_observations_are_missing():
     assert wind_grid["east"].max() > calm_grid["east"].max()
 
 
-def test_grid_uses_absolute_concentrations():
+def test_grid_clips_negative_concentrations_instead_of_creating_mass():
     anchors = _anchors().iloc[:1].copy()
     anchors["value"] = -0.12
 
     grid = build_concentration_grid(anchors, data_kind="observed")
 
     assert (grid["value"] >= 0.0).all()
-    assert grid["value"].max() > 0.0
+    assert grid["value"].max() == 0.0
     assert grid["value"].nunique() == 1
     assert (grid["north"].max() - anchors.iloc[0].latitude) * 111_320 > 900
+
+
+def test_semiphysical_forecast_stores_physical_and_statistical_components():
+    anchors = _anchors().iloc[:3].copy()
+    analysis = assimilate_observations(
+        anchors,
+        None,
+        wind_speed=2.0,
+        wind_from_degrees=270.0,
+    )
+    forecast_anchors = anchors.copy()
+    forecast_anchors["value"] = [0.05, 0.09, 0.13]
+    forecast = build_semiphysical_forecast_grid(
+        analysis,
+        forecast_anchors,
+        substance_code="NO2",
+        wind_speed=2.0,
+        wind_from_degrees=270.0,
+        boundary_layer_height=600.0,
+        precipitation=0.2,
+    )
+
+    assert not forecast.empty
+    assert forecast["physical_forecast"].notna().all()
+    assert forecast["correction_value"].notna().all()
+    assert forecast["analysis_value"].isna().all()
+    assert (forecast["diffusion_coefficient"] > 0).all()
+    assert (forecast["decay_coefficient"] > 0).all()
+    assert (forecast["value"] >= 0).all()

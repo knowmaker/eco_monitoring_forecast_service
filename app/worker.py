@@ -37,9 +37,17 @@ def run_forever() -> None:
 def ensure_model_artifact() -> None:
     artifact_path = get_settings().ARTIFACTS_DIR / "current" / "gas_forecast.joblib"
     if artifact_path.is_file():
-        return
+        try:
+            from app.models.base import load_artifact
 
-    logging.info("Model artifact is missing at %s; starting initial training", artifact_path)
+            artifact = load_artifact(artifact_path)
+            if artifact.metadata.get("prediction_mode") == "physical_residual":
+                return
+            logging.info("Existing model uses the previous direct-prediction format; retraining")
+        except Exception as error:
+            logging.warning("Current model artifact cannot be loaded and will be replaced: %s", error)
+
+    logging.info("Training the current semi-physical correction model at %s", artifact_path)
     from app.training.train import train_and_replace
 
     result = train_and_replace()
