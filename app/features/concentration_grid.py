@@ -295,7 +295,14 @@ def _interpolate_cluster(
         _confidence(distances, len(anchors)),
         transported_confidence,
     )
-    keep = np.isfinite(values) & (confidence >= 0.04)
+    inside_coverage = distances.min(axis=1) <= buffer
+    if source_x.size:
+        transported_distances = np.hypot(
+            grid_x[:, None] - (source_x + wind_x * displacement)[None, :],
+            grid_y[:, None] - (source_y + wind_y * displacement)[None, :],
+        )
+        inside_coverage |= transported_distances.min(axis=1) <= buffer
+    keep = np.isfinite(values) & (confidence >= 0.04) & inside_coverage
     grid_x = grid_x[keep]
     grid_y = grid_y[keep]
     values = values[keep]
@@ -626,8 +633,16 @@ def build_semiphysical_forecast_grid(
                 anchors["latitude"].to_numpy(float), anchors["longitude"].to_numpy(float),
                 reference_latitude, reference_longitude,
             )
-        coverage_x = np.concatenate((shifted_x, anchor_x))
-        coverage_y = np.concatenate((shifted_y, anchor_y))
+        coverage_x = np.concatenate((
+            shifted_x,
+            anchor_x - float(settings.GRID_BUFFER_METERS),
+            anchor_x + float(settings.GRID_BUFFER_METERS),
+        ))
+        coverage_y = np.concatenate((
+            shifted_y,
+            anchor_y - float(settings.GRID_BUFFER_METERS),
+            anchor_y + float(settings.GRID_BUFFER_METERS),
+        ))
         x_min = np.floor(coverage_x.min() / step) * step
         x_max = np.ceil(coverage_x.max() / step) * step
         y_min = np.floor(coverage_y.min() / step) * step
@@ -682,7 +697,22 @@ def build_semiphysical_forecast_grid(
 
         values = np.maximum(physical_flat + correction, 0.0)
         confidence = np.maximum(transported_confidence.ravel(), anchor_confidence)
-        keep = np.isfinite(values) & (confidence >= 0.04)
+        if anchor_x.size:
+            station_distance = np.hypot(
+                flat_x[:, None] - anchor_x[None, :],
+                flat_y[:, None] - anchor_y[None, :],
+            ).min(axis=1)
+            transported_distance = np.hypot(
+                flat_x[:, None] - (anchor_x + wind_x * displacement)[None, :],
+                flat_y[:, None] - (anchor_y + wind_y * displacement)[None, :],
+            ).min(axis=1)
+            rounded_coverage = (
+                (station_distance <= float(settings.GRID_BUFFER_METERS))
+                | (transported_distance <= float(settings.GRID_BUFFER_METERS))
+            )
+        else:
+            rounded_coverage = np.ones_like(values, dtype=bool)
+        keep = np.isfinite(values) & (confidence >= 0.04) & rounded_coverage
         flat_x = flat_x[keep]
         flat_y = flat_y[keep]
         values = values[keep]

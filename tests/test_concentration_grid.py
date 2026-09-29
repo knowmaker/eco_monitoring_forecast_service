@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 from app.features.concentration_grid import (
@@ -121,6 +122,24 @@ def test_grid_clips_negative_concentrations_instead_of_creating_mass():
     assert grid["value"].max() == 0.0
     assert grid["value"].nunique() == 1
     assert (grid["north"].max() - anchors.iloc[0].latitude) * 111_320 > 900
+
+
+def test_single_station_grid_has_rounded_coverage():
+    anchors = _anchors().iloc[:1].copy()
+
+    grid = build_concentration_grid(anchors, data_kind="observed")
+
+    latitude = float(anchors.iloc[0].latitude)
+    longitude = float(anchors.iloc[0].longitude)
+    northing = (grid["latitude"] - latitude) * 111_320.0
+    easting = (
+        (grid["longitude"] - longitude)
+        * 111_320.0
+        * np.cos(np.deg2rad(latitude))
+    )
+    distances = np.hypot(easting, northing)
+    assert distances.max() <= 1500.01
+    assert len(grid) < 31 * 31
 
 
 def test_semiphysical_forecast_stores_physical_and_statistical_components():
