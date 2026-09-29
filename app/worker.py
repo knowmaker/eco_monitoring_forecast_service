@@ -41,9 +41,12 @@ def ensure_model_artifact() -> None:
             from app.models.base import load_artifact
 
             artifact = load_artifact(artifact_path)
-            if artifact.metadata.get("prediction_mode") == "physical_residual":
+            if (
+                artifact.metadata.get("prediction_mode") == "physical_residual"
+                and "monitoring_post_id" not in artifact.feature_columns
+            ):
                 return
-            logging.info("Existing model uses the previous direct-prediction format; retraining")
+            logging.info("Existing model uses an outdated feature contract; retraining")
         except Exception as error:
             logging.warning("Current model artifact cannot be loaded and will be replaced: %s", error)
 

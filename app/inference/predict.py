@@ -59,7 +59,6 @@ def predict_all_stations(cutoff: datetime) -> dict[str, int]:
         try:
             artifact = load_artifact(resolve_artifact_path(model["artifact_path"]))
             prepared = rows.copy()
-            prepared["monitoring_post_id"] = prepared["monitoring_post_id"].astype(str)
             prepared["substance_code"] = prepared["substance_code"].astype(str)
             results = prediction_results(artifact, prepared)
             for row, result in zip(rows.itertuples(index=False), results, strict=True):

@@ -43,8 +43,8 @@ def evaluate_temporal_and_station_holdouts() -> dict[str, object]:
     with db_connection(readonly=True) as connection:
         frame = _training_frame(connection)
     frame = frame.dropna(subset=["target_value", "physical_baseline", "correction_target"]).copy()
-    columns = feature_columns(frame, include_post_id=True) + ["substance_code"]
-    categorical = ["monitoring_post_id", "substance_code"]
+    columns = feature_columns(frame, include_post_id=False) + ["substance_code"]
+    categorical = ["substance_code"]
     frame["monitoring_post_id"] = frame["monitoring_post_id"].astype(str)
     frame["substance_code"] = frame["substance_code"].astype(str)
     distinct_hours = np.asarray(sorted(frame["target_start"].unique()))

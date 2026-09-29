@@ -36,9 +36,8 @@ def train_and_replace() -> dict[str, object]:
         if len(clean) < settings.MIN_TRAIN_ROWS:
             raise ValueError(f"{len(clean)} training rows; at least {settings.MIN_TRAIN_ROWS} required.")
 
-        columns = feature_columns(clean, include_post_id=True) + ["substance_code"]
-        categorical = ["monitoring_post_id", "substance_code"]
-        clean["monitoring_post_id"] = clean["monitoring_post_id"].astype(str)
+        columns = feature_columns(clean, include_post_id=False) + ["substance_code"]
+        categorical = ["substance_code"]
         clean["substance_code"] = clean["substance_code"].astype(str)
         split = chronological_split(clean, settings.TEST_FRACTION)
 
