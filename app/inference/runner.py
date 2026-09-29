@@ -22,15 +22,20 @@ def current_cutoff(now: datetime | None = None) -> datetime:
     return local.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc)
 
 
-def run_forecast(cutoff: datetime | None = None) -> dict[str, object]:
+def run_forecast(
+    cutoff: datetime | None = None,
+    *,
+    sync_weather: bool = True,
+) -> dict[str, object]:
     resolved_cutoff = cutoff or current_cutoff()
     with db_connection() as connection:
         hourly_rows = refresh_hourly_gas_features(connection, cutoff=resolved_cutoff)
-        try:
-            weather_rows = sync_live_weather(connection)
-        except Exception as error:
-            logger.warning("Open-Meteo synchronisation failed: %s", error)
-            weather_rows = 0
+        weather_rows = 0
+        if sync_weather:
+            try:
+                weather_rows = sync_live_weather(connection)
+            except Exception as error:
+                logger.warning("Open-Meteo synchronisation failed: %s", error)
     predictions = predict_all_stations(resolved_cutoff)
     grid_cells = refresh_concentration_grids(resolved_cutoff)
     return {

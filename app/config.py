@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(validation_alias=AliasChoices("DATABASE_URL", "DB_DSN"))
     APP_TIMEZONE: str = "Europe/Moscow"
     FORECAST_RUN_MINUTE: int = Field(default=10, ge=0, le=59)
+    FORECAST_CATCHUP_HOURS: int = Field(default=24, ge=1, le=168)
     FEATURE_LOOKBACK_HOURS: int = Field(default=72, ge=24)
     ACTIVE_GASES: str = "CO,NO,NO2,O3,SO2"
     ARTIFACTS_DIR: Path = SERVICE_ROOT / "artifacts"
