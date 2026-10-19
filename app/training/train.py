@@ -11,7 +11,7 @@ from app.features.spatial_features import add_spatial_features
 from app.models.base import ModelArtifact, serialize_artifact
 from app.models.spatial import create_estimator
 from app.training.backtest import chronological_split, regression_metrics, residual_interval
-from app.training.model_store import replace_current_model
+from app.training.model_store import get_current_model, replace_current_model
 
 
 def _training_frame(connection) -> pd.DataFrame:
@@ -29,9 +29,23 @@ def _training_frame(connection) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True, sort=False).sort_values("target_start").reset_index(drop=True)
 
 
+def _should_activate(
+    current_model: dict[str, object] | None,
+    candidate_metrics: dict[str, object],
+) -> tuple[bool, str]:
+    if current_model is None:
+        return True, "initial_model"
+    candidate_mae = float(candidate_metrics["overall"]["mae"])
+    current_mae = float(current_model["metrics"]["overall"]["mae"])
+    if candidate_mae <= current_mae:
+        return True, "quality_not_worse"
+    return False, "candidate_mae_is_worse"
+
+
 def train_and_replace() -> dict[str, object]:
     settings = get_settings()
     with db_connection() as connection:
+        current_model = get_current_model(connection)
         clean = _training_frame(connection)
         if len(clean) < settings.MIN_TRAIN_ROWS:
             raise ValueError(f"{len(clean)} training rows; at least {settings.MIN_TRAIN_ROWS} required.")
@@ -81,6 +95,15 @@ def train_and_replace() -> dict[str, object]:
                     split.test.loc[mask, "target_value"], predicted[mask.to_numpy()]
                 )
 
+        activated, activation_reason = _should_activate(current_model, metrics)
+        if not activated:
+            return {
+                "rows": len(clean),
+                "metrics": metrics,
+                "activated": False,
+                "activation_reason": activation_reason,
+            }
+
         final_estimator = create_estimator(categorical)
         final_estimator.fit(clean[columns], clean["correction_target"])
         artifact = ModelArtifact(
@@ -94,6 +117,7 @@ def train_and_replace() -> dict[str, object]:
                 "residual_intervals": residual_intervals,
                 "prediction_mode": "physical_residual",
                 "active_gases": list(settings.active_gases),
+                "spatial_analysis": "anisotropic_optimal_interpolation",
             },
         )
         replace_current_model(
@@ -107,7 +131,12 @@ def train_and_replace() -> dict[str, object]:
             metrics=metrics,
             residual_intervals=residual_intervals,
         )
-        return {"rows": len(clean), "metrics": metrics}
+        return {
+            "rows": len(clean),
+            "metrics": metrics,
+            "activated": True,
+            "activation_reason": activation_reason,
+        }
 
 
 def main() -> None:

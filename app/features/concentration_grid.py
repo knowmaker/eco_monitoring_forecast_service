@@ -12,6 +12,8 @@ from app.features.physical_baseline import GAS_DECAY_PER_HOUR, GAS_RAIN_SCAVENGI
 
 
 METERS_PER_DEGREE_LATITUDE = 111_320.0
+SECONDS_PER_HOUR = 3600.0
+COVARIANCE_AT_RADIUS = 0.05
 
 
 def _project(
@@ -38,282 +40,345 @@ def _unproject(
     return latitudes, longitudes
 
 
-def _station_clusters(x: np.ndarray, y: np.ndarray, maximum_distance: float) -> list[list[int]]:
-    parents = list(range(len(x)))
-
-    def find(index: int) -> int:
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = parents[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parents[right_root] = left_root
-
-    for left in range(len(x)):
-        for right in range(left + 1, len(x)):
-            if float(np.hypot(x[left] - x[right], y[left] - y[right])) <= maximum_distance:
-                union(left, right)
-
-    groups: dict[int, list[int]] = {}
-    for index in range(len(x)):
-        groups.setdefault(find(index), []).append(index)
-    return list(groups.values())
-
-
-def _wind_components(wind_speed: float | None, wind_from_degrees: float | None) -> tuple[float, float]:
-    if wind_speed is None or wind_from_degrees is None:
-        return 0.0, 0.0
-    if not np.isfinite(wind_speed) or not np.isfinite(wind_from_degrees):
-        return 0.0, 0.0
-    wind_to_radians = np.deg2rad((float(wind_from_degrees) + 180.0) % 360.0)
-    return float(np.sin(wind_to_radians)), float(np.cos(wind_to_radians))
-
-
-def _advection_distance(wind_speed: float | None, maximum_distance: float) -> float:
-    if wind_speed is None or not np.isfinite(wind_speed):
-        return 0.0
-    return min(max(float(wind_speed), 0.0) * 3600.0, maximum_distance)
-
-
-def _interpolation_weights(
-    grid_x: np.ndarray,
-    grid_y: np.ndarray,
-    station_x: np.ndarray,
-    station_y: np.ndarray,
-    wind_speed: float | None,
-    wind_from_degrees: float | None,
+def _wind_components(
+    wind_speed: float | np.ndarray | None,
+    wind_from_degrees: float | np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    delta_x = grid_x[:, None] - station_x[None, :]
-    delta_y = grid_y[:, None] - station_y[None, :]
-    distances = np.hypot(delta_x, delta_y)
-    wind_x, wind_y = _wind_components(wind_speed, wind_from_degrees)
-    if wind_x == 0.0 and wind_y == 0.0:
-        scale = 450.0
-        weights = np.exp(-0.5 * (distances / scale) ** 2)
-    else:
-        along_wind = delta_x * wind_x + delta_y * wind_y
-        across_wind = -delta_x * wind_y + delta_y * wind_x
-        downwind_scale = 450.0 + min(max(float(wind_speed), 0.0), 12.0) * 90.0
-        along_scale = np.where(along_wind >= 0.0, downwind_scale, 300.0)
-        weights = np.exp(-0.5 * ((along_wind / along_scale) ** 2 + (across_wind / 350.0) ** 2))
-    weights *= 1.0 / np.maximum(distances, 25.0)
-    return weights, distances
+    speed = np.asarray(0.0 if wind_speed is None else wind_speed, dtype=float)
+    direction = np.asarray(
+        0.0 if wind_from_degrees is None else wind_from_degrees,
+        dtype=float,
+    )
+    valid = np.isfinite(speed) & np.isfinite(direction)
+    speed = np.where(valid, np.maximum(speed, 0.0), 0.0)
+    wind_to_radians = np.deg2rad((np.where(valid, direction, 0.0) + 180.0) % 360.0)
+    return np.sin(wind_to_radians) * speed, np.cos(wind_to_radians) * speed
 
 
-def _weighted_values(weights: np.ndarray, values: np.ndarray) -> np.ndarray:
-    finite = np.isfinite(values)
+def _wind_direction(wind_u: np.ndarray, wind_v: np.ndarray) -> np.ndarray:
+    speed = np.hypot(wind_u, wind_v)
+    wind_to = (np.rad2deg(np.arctan2(wind_u, wind_v)) + 360.0) % 360.0
+    return np.where(speed > 0.0, (wind_to + 180.0) % 360.0, np.nan)
+
+
+def _numeric(frame: pd.DataFrame, column: str, default: float = np.nan) -> np.ndarray:
+    if column not in frame:
+        return np.full(len(frame), default, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+
+
+def _clean_anchors(anchors: pd.DataFrame) -> pd.DataFrame:
+    required = {"monitoring_post_id", "latitude", "longitude", "value"}
+    if anchors.empty or not required.issubset(anchors.columns):
+        return pd.DataFrame()
+    clean = anchors.copy()
+    numeric_columns = (
+        "latitude",
+        "longitude",
+        "value",
+        "lower_bound",
+        "upper_bound",
+        "samples_count",
+        "observation_confidence",
+        "weather_wind_speed",
+        "weather_wind_direction",
+        "weather_boundary_layer_height",
+        "weather_precipitation",
+    )
+    for column in numeric_columns:
+        if column not in clean:
+            clean[column] = np.nan
+        clean[column] = pd.to_numeric(clean[column], errors="coerce")
+    clean = clean.dropna(subset=["latitude", "longitude", "value"]).reset_index(drop=True)
+    clean["value"] = clean["value"].clip(lower=0.0)
+    clean["lower_bound"] = clean["lower_bound"].clip(lower=0.0)
+    clean["upper_bound"] = clean["upper_bound"].clip(lower=0.0)
+    return clean
+
+
+def _observation_confidence(anchors: pd.DataFrame) -> np.ndarray:
+    supplied = _numeric(anchors, "observation_confidence")
+    confidence = np.where(np.isfinite(supplied), supplied, np.nan)
+
+    samples = _numeric(anchors, "samples_count")
+    if np.isfinite(samples).any():
+        maximum = max(float(np.nanmax(samples)), 1.0)
+        sample_confidence = np.clip(samples / maximum, 0.05, 1.0)
+        confidence = np.where(np.isfinite(confidence), confidence, sample_confidence)
+
+    lower = _numeric(anchors, "lower_bound")
+    upper = _numeric(anchors, "upper_bound")
+    values = _numeric(anchors, "value")
+    interval_width = upper - lower
+    interval_confidence = 1.0 / (
+        1.0 + np.maximum(interval_width, 0.0) / np.maximum(np.abs(values), 1e-9)
+    )
+    usable_interval = np.isfinite(interval_width) & (interval_width >= 0.0)
+    confidence = np.where(
+        np.isfinite(confidence),
+        confidence,
+        np.where(usable_interval, interval_confidence, 1.0),
+    )
+    return np.clip(confidence, 0.05, 1.0)
+
+
+def _anchor_weather(
+    anchors: pd.DataFrame,
+    fallback_speed: float | None,
+    fallback_direction: float | None,
+    fallback_pbl: float | None = None,
+    fallback_rain: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    speeds = _numeric(anchors, "weather_wind_speed")
+    directions = _numeric(anchors, "weather_wind_direction")
+    valid = np.isfinite(speeds) & np.isfinite(directions)
+    default_speed = max(float(fallback_speed or 0.0), 0.0)
+    default_direction = float(fallback_direction or 0.0)
+    speeds = np.where(valid, np.maximum(speeds, 0.0), default_speed)
+    directions = np.where(valid, directions, default_direction)
+    wind_u, wind_v = _wind_components(speeds, directions)
+
+    pbl = _numeric(anchors, "weather_boundary_layer_height")
+    pbl_default = (
+        float(fallback_pbl)
+        if fallback_pbl is not None and np.isfinite(fallback_pbl)
+        else 500.0
+    )
+    pbl = np.where(np.isfinite(pbl), np.clip(pbl, 50.0, 4000.0), pbl_default)
+    rain = _numeric(anchors, "weather_precipitation")
+    rain_default = max(float(fallback_rain or 0.0), 0.0)
+    rain = np.where(np.isfinite(rain), np.maximum(rain, 0.0), rain_default)
+    return wind_u, wind_v, pbl, rain
+
+
+def _interpolate_nearest_values(
+    query_x: np.ndarray,
+    query_y: np.ndarray,
+    source_x: np.ndarray,
+    source_y: np.ndarray,
+    values: np.ndarray,
+    fallback: float,
+) -> np.ndarray:
+    finite = np.isfinite(source_x) & np.isfinite(source_y) & np.isfinite(values)
     if not finite.any():
-        return np.full(weights.shape[0], np.nan)
-    usable = weights[:, finite]
-    totals = usable.sum(axis=1)
-    return np.divide(
-        usable @ values[finite],
-        totals,
-        out=np.full(weights.shape[0], np.nan),
-        where=totals > 0,
+        return np.full(len(query_x), fallback, dtype=float)
+    points = np.column_stack((source_x[finite], source_y[finite]))
+    usable_values = values[finite]
+    count = min(4, len(points))
+    distances, indexes = cKDTree(points).query(
+        np.column_stack((query_x, query_y)),
+        k=count,
     )
+    if count == 1:
+        return usable_values[np.asarray(indexes, dtype=int)]
+    distances = np.asarray(distances, dtype=float)
+    indexes = np.asarray(indexes, dtype=int)
+    exact = distances[:, 0] <= 1e-9
+    weights = 1.0 / np.maximum(distances, 1.0) ** 2
+    interpolated = np.sum(weights * usable_values[indexes], axis=1) / np.sum(weights, axis=1)
+    interpolated[exact] = usable_values[indexes[exact, 0]]
+    return interpolated
 
 
-def _confidence(distances: np.ndarray, station_count: int) -> np.ndarray:
-    ordered = np.sort(distances, axis=1)
-    nearest = ordered[:, 0]
-    supporting_distance = ordered[:, min(2, station_count - 1)]
-    buffer = float(get_settings().GRID_BUFFER_METERS)
-    proximity = np.exp(-0.5 * (nearest / (buffer * 0.55)) ** 2)
-    geometry = (
-        np.exp(-supporting_distance / (buffer * 1.5))
-        if station_count > 1
-        else np.ones_like(nearest)
-    )
-    return np.clip(proximity * geometry, 0.0, 1.0)
+def _anisotropic_correlation(
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    source_x: np.ndarray,
+    source_y: np.ndarray,
+    source_wind_u: np.ndarray,
+    source_wind_v: np.ndarray,
+    radius: float,
+) -> np.ndarray:
+    delta_x = target_x[:, None] - source_x[None, :]
+    delta_y = target_y[:, None] - source_y[None, :]
+    distances = np.hypot(delta_x, delta_y)
+    speed = np.hypot(source_wind_u, source_wind_v)
+    unit_u = np.divide(source_wind_u, speed, out=np.zeros_like(speed), where=speed > 0.1)
+    unit_v = np.divide(source_wind_v, speed, out=np.ones_like(speed), where=speed > 0.1)
+    along = delta_x * unit_u[None, :] + delta_y * unit_v[None, :]
+    across = -delta_x * unit_v[None, :] + delta_y * unit_u[None, :]
+
+    sigma_along = radius / np.sqrt(-2.0 * np.log(COVARIANCE_AT_RADIUS))
+    anisotropy = 1.0 + np.minimum(speed / 5.0, 2.0)
+    sigma_across = sigma_along / anisotropy
+    sigma_across = np.where(speed <= 0.1, sigma_along, sigma_across)
+    normalized = (along / sigma_along) ** 2 + (across / sigma_across[None, :]) ** 2
+    correlation = np.exp(-0.5 * normalized)
+    correlation[distances > radius] = 0.0
+    return correlation
 
 
-def _correct_to_anchors(
+def _sample_grid(
+    query_x: np.ndarray,
+    query_y: np.ndarray,
     grid_x: np.ndarray,
     grid_y: np.ndarray,
     values: np.ndarray,
-    station_x: np.ndarray,
-    station_y: np.ndarray,
-    station_values: np.ndarray,
-    wind_speed: float | None,
-    wind_from_degrees: float | None,
-    estimated_at_stations: np.ndarray | None = None,
+    step: float,
+    default: float,
 ) -> np.ndarray:
-    if estimated_at_stations is None:
-        station_weights, _ = _interpolation_weights(
-            station_x,
-            station_y,
-            station_x,
-            station_y,
-            wind_speed,
-            wind_from_degrees,
-        )
-        estimated_at_stations = _weighted_values(station_weights, station_values)
-    residuals = station_values - estimated_at_stations
-    delta_x = grid_x[:, None] - station_x[None, :]
-    delta_y = grid_y[:, None] - station_y[None, :]
-    correction_weights = np.exp(-0.5 * (np.hypot(delta_x, delta_y) / 180.0) ** 2)
-    return values + _weighted_values(correction_weights, residuals)
+    if not len(grid_x):
+        return np.full(len(query_x), default, dtype=float)
+    distances, indexes = cKDTree(np.column_stack((grid_x, grid_y))).query(
+        np.column_stack((query_x, query_y)),
+        k=1,
+    )
+    sampled = np.full(len(query_x), default, dtype=float)
+    usable = (distances <= step * 0.8) & np.isfinite(values[indexes])
+    sampled[usable] = values[indexes[usable]]
+    return sampled
 
 
-def _interpolate_cluster(
-    anchors: pd.DataFrame,
-    source_anchors: pd.DataFrame,
-    *,
-    cluster_id: int,
-    data_kind: str,
-    wind_speed: float | None,
-    wind_from_degrees: float | None,
-) -> pd.DataFrame:
-    settings = get_settings()
-    reference_latitude = float(anchors["latitude"].mean())
-    reference_longitude = float(anchors["longitude"].mean())
-    station_x, station_y = _project(
-        anchors["latitude"].to_numpy(dtype=float),
-        anchors["longitude"].to_numpy(dtype=float),
-        reference_latitude,
-        reference_longitude,
-    )
-    step = float(settings.GRID_CELL_METERS)
-    buffer = float(settings.GRID_BUFFER_METERS)
-    transport_anchors = source_anchors
-    if data_kind == "forecast" and len(transport_anchors) < settings.GRID_MIN_STATIONS:
-        transport_anchors = anchors
-    source_x = np.asarray([], dtype=float)
-    source_y = np.asarray([], dtype=float)
-    wind_x, wind_y = _wind_components(wind_speed, wind_from_degrees)
-    displacement = 0.0
-    if data_kind == "forecast" and len(transport_anchors) >= settings.GRID_MIN_STATIONS:
-        source_x, source_y = _project(
-            transport_anchors["latitude"].to_numpy(dtype=float),
-            transport_anchors["longitude"].to_numpy(dtype=float),
-            reference_latitude,
-            reference_longitude,
-        )
-        displacement = _advection_distance(
-            wind_speed,
-            float(settings.GRID_MAX_ADVECTION_METERS),
-        )
+def _optimal_interpolation(
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+    background: np.ndarray,
+    background_confidence: np.ndarray,
+    observation_x: np.ndarray,
+    observation_y: np.ndarray,
+    observation_values: np.ndarray,
+    observation_confidence: np.ndarray,
+    observation_wind_u: np.ndarray,
+    observation_wind_v: np.ndarray,
+    step: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not len(observation_x):
+        return background.copy(), background_confidence.copy(), np.zeros_like(background)
 
-    coverage_x = np.concatenate((station_x, source_x + wind_x * displacement))
-    coverage_y = np.concatenate((station_y, source_y + wind_y * displacement))
-    x_values = np.arange(
-        np.floor((coverage_x.min() - buffer) / step) * step,
-        np.ceil((coverage_x.max() + buffer) / step) * step + step,
-        step,
-    )
-    y_values = np.arange(
-        np.floor((coverage_y.min() - buffer) / step) * step,
-        np.ceil((coverage_y.max() + buffer) / step) * step + step,
-        step,
-    )
-    mesh_x, mesh_y = np.meshgrid(x_values, y_values)
-    grid_x = mesh_x.ravel()
-    grid_y = mesh_y.ravel()
-    weights, distances = _interpolation_weights(
+    radius = float(get_settings().MAX_OBSERVATION_INFLUENCE_METERS)
+    background_at_observations = _sample_grid(
+        observation_x,
+        observation_y,
         grid_x,
         grid_y,
-        station_x,
-        station_y,
-        wind_speed,
-        wind_from_degrees,
+        background,
+        step,
+        0.0,
     )
-    station_values = anchors["value"].to_numpy(dtype=float)
-    values = _weighted_values(weights, station_values)
-    station_weights, _ = _interpolation_weights(
-        station_x,
-        station_y,
-        station_x,
-        station_y,
-        wind_speed,
-        wind_from_degrees,
-    )
-    estimated_at_stations = _weighted_values(station_weights, station_values)
-    transported_confidence = np.zeros(len(grid_x), dtype=float)
-
-    if source_x.size:
-        source_weights, source_distances = _interpolation_weights(
-            grid_x - wind_x * displacement,
-            grid_y - wind_y * displacement,
-            source_x,
-            source_y,
-            wind_speed,
-            wind_from_degrees,
-        )
-        transported = _weighted_values(source_weights, transport_anchors["value"].to_numpy(dtype=float))
-        usable = np.isfinite(transported)
-        values[usable] = (
-            values[usable] * (1.0 - settings.GRID_TRANSPORT_BLEND)
-            + transported[usable] * settings.GRID_TRANSPORT_BLEND
-        )
-        source_station_weights, _ = _interpolation_weights(
-            station_x - wind_x * displacement,
-            station_y - wind_y * displacement,
-            source_x,
-            source_y,
-            wind_speed,
-            wind_from_degrees,
-        )
-        transported_at_stations = _weighted_values(
-            source_station_weights,
-            transport_anchors["value"].to_numpy(dtype=float),
-        )
-        usable_at_stations = np.isfinite(transported_at_stations)
-        estimated_at_stations[usable_at_stations] = (
-            estimated_at_stations[usable_at_stations] * (1.0 - settings.GRID_TRANSPORT_BLEND)
-            + transported_at_stations[usable_at_stations] * settings.GRID_TRANSPORT_BLEND
-        )
-        transported_confidence = 0.7 * _confidence(
-            source_distances,
-            len(transport_anchors),
-        )
-
-    values = _correct_to_anchors(
+    confidence_at_observations = _sample_grid(
+        observation_x,
+        observation_y,
         grid_x,
         grid_y,
-        values,
-        station_x,
-        station_y,
-        station_values,
-        wind_speed,
-        wind_from_degrees,
-        estimated_at_stations,
+        background_confidence,
+        step,
+        0.0,
     )
-    if len(anchors) == 1:
-        values.fill(station_values[0])
-    values = np.maximum(values, 0.0)
+    innovations = observation_values - background_at_observations
+    grid_variance = np.clip(1.0 - background_confidence, 0.05, 1.0)
+    observation_background_variance = np.clip(
+        1.0 - confidence_at_observations,
+        0.05,
+        1.0,
+    )
 
-    lower_bounds = _weighted_values(weights, anchors["lower_bound"].to_numpy(dtype=float))
-    upper_bounds = _weighted_values(weights, anchors["upper_bound"].to_numpy(dtype=float))
-    lower_bounds = np.where(np.isfinite(lower_bounds), np.minimum(lower_bounds, values), np.nan)
-    upper_bounds = np.where(np.isfinite(upper_bounds), np.maximum(upper_bounds, values), np.nan)
-    confidence = np.maximum(
-        _confidence(distances, len(anchors)),
-        transported_confidence,
+    correlation_oo = _anisotropic_correlation(
+        observation_x,
+        observation_y,
+        observation_x,
+        observation_y,
+        observation_wind_u,
+        observation_wind_v,
+        radius,
     )
-    inside_coverage = distances.min(axis=1) <= buffer
-    if source_x.size:
-        transported_distances = np.hypot(
-            grid_x[:, None] - (source_x + wind_x * displacement)[None, :],
-            grid_y[:, None] - (source_y + wind_y * displacement)[None, :],
+    correlation_oo = (correlation_oo + correlation_oo.T) / 2.0
+    np.fill_diagonal(correlation_oo, 1.0)
+    covariance_oo = correlation_oo * np.sqrt(
+        observation_background_variance[:, None]
+        * observation_background_variance[None, :]
+    )
+    observation_error = np.clip(1.0 - observation_confidence, 0.01, 1.0)
+    system = covariance_oo + np.diag(observation_error)
+
+    covariance_go = _anisotropic_correlation(
+        grid_x,
+        grid_y,
+        observation_x,
+        observation_y,
+        observation_wind_u,
+        observation_wind_v,
+        radius,
+    ) * np.sqrt(grid_variance[:, None] * observation_background_variance[None, :])
+    try:
+        coefficients = np.linalg.solve(system, innovations)
+        solved_covariance = np.linalg.solve(system, covariance_go.T).T
+    except np.linalg.LinAlgError:
+        coefficients = np.linalg.lstsq(system, innovations, rcond=None)[0]
+        solved_covariance = np.linalg.lstsq(system, covariance_go.T, rcond=None)[0].T
+
+    increment = covariance_go @ coefficients
+    variance_reduction = np.sum(covariance_go * solved_covariance, axis=1)
+    posterior_variance = np.clip(grid_variance - variance_reduction, 0.0, 1.0)
+    confidence = np.maximum(background_confidence, 1.0 - posterior_variance)
+    return np.maximum(background + increment, 0.0), np.clip(confidence, 0.0, 1.0), increment
+
+
+def _backward_innovation(
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+    observation_x: np.ndarray,
+    observation_y: np.ndarray,
+    innovations: np.ndarray,
+    observation_confidence: np.ndarray,
+    observation_wind_u: np.ndarray,
+    observation_wind_v: np.ndarray,
+    step: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    correction_numerator = np.zeros(len(grid_x), dtype=float)
+    correction_weight = np.zeros(len(grid_x), dtype=float)
+    radius = float(get_settings().MAX_OBSERVATION_INFLUENCE_METERS)
+
+    for index in range(len(observation_x)):
+        path_x = -observation_wind_u[index] * SECONDS_PER_HOUR
+        path_y = -observation_wind_v[index] * SECONDS_PER_HOUR
+        displacement = np.hypot(path_x, path_y)
+        if displacement < step or not np.isfinite(innovations[index]):
+            continue
+        relative_x = grid_x - observation_x[index]
+        relative_y = grid_y - observation_y[index]
+        fraction = np.clip(
+            (relative_x * path_x + relative_y * path_y) / displacement**2,
+            step / displacement,
+            1.0,
         )
-        inside_coverage |= transported_distances.min(axis=1) <= buffer
-    keep = (
-        np.isfinite(values)
-        & (confidence >= settings.GRID_MIN_CONFIDENCE)
-        & inside_coverage
-    )
-    grid_x = grid_x[keep]
-    grid_y = grid_y[keep]
-    values = values[keep]
-    confidence = confidence[keep]
-    lower_bounds = lower_bounds[keep]
-    upper_bounds = upper_bounds[keep]
+        closest_x = observation_x[index] + path_x * fraction
+        closest_y = observation_y[index] + path_y * fraction
+        delta_x = grid_x - closest_x
+        delta_y = grid_y - closest_y
+        distance = np.hypot(delta_x, delta_y)
+        speed = np.hypot(observation_wind_u[index], observation_wind_v[index])
+        unit_u = observation_wind_u[index] / speed
+        unit_v = observation_wind_v[index] / speed
+        along = delta_x * unit_u + delta_y * unit_v
+        across = -delta_x * unit_v + delta_y * unit_u
+        sigma_along = radius / np.sqrt(-2.0 * np.log(COVARIANCE_AT_RADIUS))
+        sigma_across = sigma_along / (1.0 + min(speed / 5.0, 2.0))
+        strongest = np.exp(
+            -0.5 * ((along / sigma_along) ** 2 + (across / sigma_across) ** 2)
+        )
+        strongest[distance > radius] = 0.0
+        strongest *= np.exp(-fraction) * observation_confidence[index]
+        correction_numerator += strongest * innovations[index]
+        correction_weight += strongest
 
+    correction = np.divide(
+        correction_numerator,
+        correction_weight,
+        out=np.zeros_like(correction_numerator),
+        where=correction_weight > 0.0,
+    )
+    return correction, np.clip(correction_weight, 0.0, 1.0)
+
+
+def _frame_geometry(
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+    x_min: float,
+    y_min: float,
+    step: float,
+    reference_latitude: float,
+    reference_longitude: float,
+) -> dict[str, np.ndarray]:
     latitudes, longitudes = _unproject(
         grid_x,
         grid_y,
@@ -332,92 +397,32 @@ def _interpolate_cluster(
         reference_latitude,
         reference_longitude,
     )
-    x_indexes = np.searchsorted(x_values, grid_x)
-    y_indexes = np.searchsorted(y_values, grid_y)
-    return pd.DataFrame(
-        {
-            "cluster_id": cluster_id,
-            "grid_x": x_indexes,
-            "grid_y": y_indexes,
-            "latitude": latitudes,
-            "longitude": longitudes,
-            "south": south,
-            "west": west,
-            "north": north,
-            "east": east,
-            "value": values,
-            "lower_bound": lower_bounds,
-            "upper_bound": upper_bounds,
-            "confidence": confidence,
-            "source_station_count": len(anchors),
-            "wind_speed": wind_speed,
-            "wind_direction": wind_from_degrees,
-        }
-    )
+    return {
+        "grid_x": np.rint((grid_x - x_min) / step).astype(int),
+        "grid_y": np.rint((grid_y - y_min) / step).astype(int),
+        "latitude": latitudes,
+        "longitude": longitudes,
+        "south": south,
+        "west": west,
+        "north": north,
+        "east": east,
+    }
 
 
-def build_concentration_grid(
-    anchors: pd.DataFrame,
-    *,
-    data_kind: str,
-    wind_speed: float | None = None,
-    wind_from_degrees: float | None = None,
-    source_anchors: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    required = {"monitoring_post_id", "latitude", "longitude", "value"}
-    if anchors.empty or not required.issubset(anchors.columns):
-        return pd.DataFrame()
-    clean = anchors.copy()
-    for column in ("latitude", "longitude", "value", "lower_bound", "upper_bound"):
-        if column not in clean:
-            clean[column] = np.nan
-        clean[column] = pd.to_numeric(clean[column], errors="coerce")
-    clean = clean.dropna(subset=["latitude", "longitude", "value"]).reset_index(drop=True)
-    clean["value"] = clean["value"].clip(lower=0.0)
-    valid_interval = clean["lower_bound"].notna() & clean["upper_bound"].notna()
-    clean.loc[valid_interval, "lower_bound"] = clean.loc[valid_interval, "lower_bound"].clip(lower=0.0)
-    clean.loc[valid_interval, "upper_bound"] = clean.loc[valid_interval, "upper_bound"].clip(lower=0.0)
-    if len(clean) < get_settings().GRID_MIN_STATIONS:
-        return pd.DataFrame()
-
-    reference_latitude = float(clean["latitude"].mean())
-    reference_longitude = float(clean["longitude"].mean())
-    x, y = _project(
-        clean["latitude"].to_numpy(dtype=float),
-        clean["longitude"].to_numpy(dtype=float),
-        reference_latitude,
-        reference_longitude,
-    )
-    source = source_anchors.copy() if source_anchors is not None else pd.DataFrame()
-    if not source.empty:
-        for column in ("latitude", "longitude", "value"):
-            if column not in source:
-                source[column] = np.nan
-            source[column] = pd.to_numeric(source[column], errors="coerce")
-        source = source.dropna(subset=["monitoring_post_id", "latitude", "longitude", "value"])
-        source["value"] = source["value"].clip(lower=0.0)
-    frames: list[pd.DataFrame] = []
-    for indexes in _station_clusters(x, y, float(get_settings().GRID_CLUSTER_DISTANCE_METERS)):
-        if len(indexes) < get_settings().GRID_MIN_STATIONS:
-            continue
-        cluster = clean.iloc[indexes].reset_index(drop=True)
-        station_ids = set(cluster["monitoring_post_id"].astype(int))
-        cluster_source = (
-            source[source["monitoring_post_id"].astype(int).isin(station_ids)].copy()
-            if not source.empty
-            else source
-        )
-        frames.append(
-            _interpolate_cluster(
-                cluster,
-                cluster_source,
-                cluster_id=int(cluster["monitoring_post_id"].min()),
-                data_kind=data_kind,
-                wind_speed=wind_speed,
-                wind_from_degrees=wind_from_degrees,
-            )
-        )
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+def _grid_extent(
+    support_x: np.ndarray,
+    support_y: np.ndarray,
+    step: float,
+    padding: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    x_min = np.floor((support_x.min() - padding) / step) * step
+    x_max = np.ceil((support_x.max() + padding) / step) * step
+    y_min = np.floor((support_y.min() - padding) / step) * step
+    y_max = np.ceil((support_y.max() + padding) / step) * step
+    x_values = np.arange(x_min, x_max + step, step)
+    y_values = np.arange(y_min, y_max + step, step)
+    mesh_x, mesh_y = np.meshgrid(x_values, y_values)
+    return x_values, y_values, mesh_x.ravel(), mesh_y.ravel(), x_min, y_min
 
 
 def assimilate_observations(
@@ -427,197 +432,185 @@ def assimilate_observations(
     wind_speed: float | None = None,
     wind_from_degrees: float | None = None,
 ) -> pd.DataFrame:
-    """Correct the previous forecast with current station observations."""
-    analysis = build_concentration_grid(
-        anchors,
-        data_kind="observed",
-        wind_speed=wind_speed,
-        wind_from_degrees=wind_from_degrees,
-    )
-    if analysis.empty:
-        return analysis
-    analysis["analysis_value"] = analysis["value"]
-    analysis["physical_forecast"] = np.nan
-    analysis["correction_value"] = 0.0
-    analysis["diffusion_coefficient"] = np.nan
-    analysis["decay_coefficient"] = np.nan
-    wind_x, wind_y = _wind_components(wind_speed, wind_from_degrees)
-    analysis["wind_u"] = wind_x * (float(wind_speed) if wind_speed is not None else 0.0)
-    analysis["wind_v"] = wind_y * (float(wind_speed) if wind_speed is not None else 0.0)
-    analysis["boundary_layer_height"] = np.nan
+    """Combine observations with the previous forecast using flow-dependent covariance."""
+    clean = _clean_anchors(anchors)
+    if clean.empty:
+        return pd.DataFrame()
 
-    if prior_grid is None or prior_grid.empty:
-        return analysis
+    prior = prior_grid.copy() if prior_grid is not None else pd.DataFrame()
+    latitude_values = [clean["latitude"]]
+    longitude_values = [clean["longitude"]]
+    if not prior.empty:
+        latitude_values.append(prior["latitude"])
+        longitude_values.append(prior["longitude"])
+    reference_latitude = float(pd.concat(latitude_values, ignore_index=True).mean())
+    reference_longitude = float(pd.concat(longitude_values, ignore_index=True).mean())
+    observation_x, observation_y = _project(
+        clean["latitude"].to_numpy(float),
+        clean["longitude"].to_numpy(float),
+        reference_latitude,
+        reference_longitude,
+    )
+    observation_u, observation_v, _, _ = _anchor_weather(
+        clean,
+        wind_speed,
+        wind_from_degrees,
+    )
+
+    support_x = observation_x.copy()
+    support_y = observation_y.copy()
+    prior_x = np.asarray([], dtype=float)
+    prior_y = np.asarray([], dtype=float)
+    if not prior.empty:
+        prior_x, prior_y = _project(
+            prior["latitude"].to_numpy(float),
+            prior["longitude"].to_numpy(float),
+            reference_latitude,
+            reference_longitude,
+        )
+        support_x = np.concatenate((support_x, prior_x, observation_x - observation_u * SECONDS_PER_HOUR))
+        support_y = np.concatenate((support_y, prior_y, observation_y - observation_v * SECONDS_PER_HOUR))
 
     settings = get_settings()
     step = float(settings.GRID_CELL_METERS)
-    support_distance = step * 0.8
-    radius = float(settings.PHYSICS_ASSIMILATION_RADIUS_METERS)
-    frames: list[pd.DataFrame] = []
-    for cluster_id, output in analysis.groupby("cluster_id", sort=False):
-        output = output.reset_index(drop=True)
-        cluster_prior = prior_grid[prior_grid["cluster_id"] == cluster_id]
-        if cluster_prior.empty:
-            frames.append(output)
-            continue
+    radius = float(settings.MAX_OBSERVATION_INFLUENCE_METERS)
+    _, _, grid_x, grid_y, x_min, y_min = _grid_extent(
+        support_x,
+        support_y,
+        step,
+        radius,
+    )
 
-        reference_latitude = float(pd.concat(
-            (output["latitude"], cluster_prior["latitude"]),
-            ignore_index=True,
-        ).mean())
-        reference_longitude = float(pd.concat(
-            (output["longitude"], cluster_prior["longitude"]),
-            ignore_index=True,
-        ).mean())
-        output_x, output_y = _project(
-            output["latitude"].to_numpy(float), output["longitude"].to_numpy(float),
-            reference_latitude, reference_longitude,
-        )
-        prior_x, prior_y = _project(
-            cluster_prior["latitude"].to_numpy(float), cluster_prior["longitude"].to_numpy(float),
-            reference_latitude, reference_longitude,
-        )
-        x_min = np.floor(min(output_x.min(), prior_x.min()) / step) * step
-        x_max = np.ceil(max(output_x.max(), prior_x.max()) / step) * step
-        y_min = np.floor(min(output_y.min(), prior_y.min()) / step) * step
-        y_max = np.ceil(max(output_y.max(), prior_y.max()) / step) * step
-        x_values = np.arange(x_min, x_max + step, step)
-        y_values = np.arange(y_min, y_max + step, step)
-        mesh_x, mesh_y = np.meshgrid(x_values, y_values)
-        grid_x = mesh_x.ravel()
-        grid_y = mesh_y.ravel()
-
-        output_tree = cKDTree(np.column_stack((output_x, output_y)))
+    if prior.empty:
+        background = np.zeros(len(grid_x), dtype=float)
+        background_confidence = np.zeros(len(grid_x), dtype=float)
+        lower_bounds = np.full(len(grid_x), np.nan)
+        upper_bounds = np.full(len(grid_x), np.nan)
+        prior_coverage = np.zeros(len(grid_x), dtype=bool)
+    else:
+        prior_values = _numeric(prior, "value", 0.0)
+        prior_confidence = _numeric(prior, "confidence", 0.0)
         prior_tree = cKDTree(np.column_stack((prior_x, prior_y)))
-        output_distance, output_index = output_tree.query(
-            np.column_stack((grid_x, grid_y)),
-            k=1,
+        prior_distance, prior_index = prior_tree.query(np.column_stack((grid_x, grid_y)), k=1)
+        prior_coverage = prior_distance <= step * 0.8
+        background = np.where(prior_coverage, prior_values[prior_index], 0.0)
+        background_confidence = np.where(
+            prior_coverage,
+            np.nan_to_num(prior_confidence[prior_index], nan=0.0),
+            0.0,
         )
-        prior_distance, prior_index = prior_tree.query(
-            np.column_stack((grid_x, grid_y)),
-            k=1,
-        )
-        usable_output = output_distance <= support_distance
-        usable_prior = prior_distance <= support_distance
-        keep = usable_output | usable_prior
-        grid_x = grid_x[keep]
-        grid_y = grid_y[keep]
-        output_index = output_index[keep]
-        prior_index = prior_index[keep]
-        usable_output = usable_output[keep]
-        usable_prior = usable_prior[keep]
+        prior_lower = _numeric(prior, "lower_bound")
+        prior_upper = _numeric(prior, "upper_bound")
+        lower_bounds = np.where(prior_coverage, prior_lower[prior_index], np.nan)
+        upper_bounds = np.where(prior_coverage, prior_upper[prior_index], np.nan)
 
-        output_values = output["value"].to_numpy(float)[output_index]
-        prior_values = cluster_prior["value"].to_numpy(float)[prior_index]
-        background = np.where(usable_prior, prior_values, output_values)
-        output_confidence = output["confidence"].to_numpy(float)[output_index]
-        prior_confidence = cluster_prior["confidence"].to_numpy(float)[prior_index]
-        confidence = np.maximum(
-            np.where(usable_output, output_confidence, 0.0),
-            np.where(usable_prior, prior_confidence, 0.0),
-        )
+    observation_confidence = _observation_confidence(clean)
+    values, confidence, direct_increment = _optimal_interpolation(
+        grid_x,
+        grid_y,
+        background,
+        background_confidence,
+        observation_x,
+        observation_y,
+        clean["value"].to_numpy(float),
+        observation_confidence,
+        observation_u,
+        observation_v,
+        step,
+    )
 
-        output_lower = output["lower_bound"].to_numpy(float)[output_index]
-        output_upper = output["upper_bound"].to_numpy(float)[output_index]
-        prior_lower = cluster_prior["lower_bound"].to_numpy(float)[prior_index]
-        prior_upper = cluster_prior["upper_bound"].to_numpy(float)[prior_index]
-        lower_bounds = np.where(usable_prior, prior_lower, output_lower)
-        upper_bounds = np.where(usable_prior, prior_upper, output_upper)
-
-        all_anchor_x, all_anchor_y = _project(
-            anchors["latitude"].to_numpy(float), anchors["longitude"].to_numpy(float),
-            reference_latitude, reference_longitude,
+    backward_increment = np.zeros(len(grid_x), dtype=float)
+    backward_confidence = np.zeros(len(grid_x), dtype=float)
+    if not prior.empty:
+        prior_at_observations = _sample_grid(
+            observation_x,
+            observation_y,
+            prior_x,
+            prior_y,
+            _numeric(prior, "value", 0.0),
+            step,
+            0.0,
         )
-        anchor_distance, _ = output_tree.query(
-            np.column_stack((all_anchor_x, all_anchor_y)),
-            k=1,
-        )
-        near_cluster = anchor_distance <= float(settings.GRID_BUFFER_METERS) + step * 2.0
-        cluster_anchors = anchors.loc[near_cluster]
-        if cluster_anchors.empty:
-            frames.append(output)
-            continue
-        station_x, station_y = _project(
-            cluster_anchors["latitude"].to_numpy(float), cluster_anchors["longitude"].to_numpy(float),
-            reference_latitude, reference_longitude,
-        )
-        station_prior_distance, station_prior_index = prior_tree.query(
-            np.column_stack((station_x, station_y)),
-            k=1,
-        )
-        station_values = cluster_anchors["value"].to_numpy(float)
-        estimated_at_stations = station_values.copy()
-        usable_station_prior = station_prior_distance <= step * 1.6
-        estimated_at_stations[usable_station_prior] = cluster_prior["value"].to_numpy(float)[
-            station_prior_index[usable_station_prior]
-        ]
-        residuals = station_values - estimated_at_stations
-        distances = np.hypot(
-            grid_x[:, None] - station_x[None, :],
-            grid_y[:, None] - station_y[None, :],
-        )
-        weights = np.exp(-0.5 * (distances / radius) ** 2)
-        correction = _weighted_values(weights, residuals)
-        correction *= np.exp(-0.5 * (distances.min(axis=1) / radius) ** 2)
-        corrected = np.maximum(background + correction, 0.0)
-        lower_bounds = np.where(
-            np.isfinite(lower_bounds),
-            np.minimum(lower_bounds, corrected),
-            np.nan,
-        )
-        upper_bounds = np.where(
-            np.isfinite(upper_bounds),
-            np.maximum(upper_bounds, corrected),
-            np.nan,
-        )
-        latitudes, longitudes = _unproject(
+        innovations = clean["value"].to_numpy(float) - prior_at_observations
+        backward_increment, backward_confidence = _backward_innovation(
             grid_x,
             grid_y,
-            reference_latitude,
-            reference_longitude,
+            observation_x,
+            observation_y,
+            innovations,
+            observation_confidence,
+            observation_u,
+            observation_v,
+            step,
         )
-        south, west = _unproject(
-            grid_x - step / 2.0,
-            grid_y - step / 2.0,
-            reference_latitude,
-            reference_longitude,
-        )
-        north, east = _unproject(
-            grid_x + step / 2.0,
-            grid_y + step / 2.0,
-            reference_latitude,
-            reference_longitude,
-        )
-        frames.append(pd.DataFrame({
-            "cluster_id": int(cluster_id),
-            "grid_x": np.rint((grid_x - x_min) / step).astype(int),
-            "grid_y": np.rint((grid_y - y_min) / step).astype(int),
-            "latitude": latitudes,
-            "longitude": longitudes,
-            "south": south,
-            "west": west,
-            "north": north,
-            "east": east,
-            "value": corrected,
-            "analysis_value": corrected,
-            "physical_forecast": np.nan,
-            "correction_value": correction,
-            "lower_bound": lower_bounds,
-            "upper_bound": upper_bounds,
-            "confidence": confidence,
-            "source_station_count": len(cluster_anchors),
-            "wind_speed": wind_speed,
-            "wind_direction": wind_from_degrees,
-            "wind_u": wind_x * (float(wind_speed) if wind_speed is not None else 0.0),
-            "wind_v": wind_y * (float(wind_speed) if wind_speed is not None else 0.0),
-            "boundary_layer_height": np.nan,
-            "diffusion_coefficient": np.nan,
-            "decay_coefficient": np.nan,
-        }))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        values = np.maximum(values + backward_increment * (1.0 - confidence), 0.0)
+        confidence = np.maximum(confidence, backward_confidence)
+
+    station_distance = cKDTree(np.column_stack((observation_x, observation_y))).query(
+        np.column_stack((grid_x, grid_y)),
+        k=1,
+    )[0]
+    observation_coverage = station_distance <= radius
+    backward_coverage = backward_confidence >= settings.GRID_MIN_CONFIDENCE
+    keep = (
+        np.isfinite(values)
+        & (confidence >= settings.GRID_MIN_CONFIDENCE)
+        & (prior_coverage | observation_coverage | backward_coverage)
+    )
+
+    grid_x = grid_x[keep]
+    grid_y = grid_y[keep]
+    values = values[keep]
+    confidence = confidence[keep]
+    correction = (direct_increment + backward_increment)[keep]
+    lower_bounds = np.where(
+        np.isfinite(lower_bounds[keep]),
+        np.minimum(lower_bounds[keep], values),
+        np.nan,
+    )
+    upper_bounds = np.where(
+        np.isfinite(upper_bounds[keep]),
+        np.maximum(upper_bounds[keep], values),
+        np.nan,
+    )
+
+    local_u = _interpolate_nearest_values(
+        grid_x, grid_y, observation_x, observation_y, observation_u, float(np.mean(observation_u))
+    )
+    local_v = _interpolate_nearest_values(
+        grid_x, grid_y, observation_x, observation_y, observation_v, float(np.mean(observation_v))
+    )
+    geometry = _frame_geometry(
+        grid_x,
+        grid_y,
+        x_min,
+        y_min,
+        step,
+        reference_latitude,
+        reference_longitude,
+    )
+    speed = np.hypot(local_u, local_v)
+    return pd.DataFrame({
+        **geometry,
+        "value": values,
+        "analysis_value": values,
+        "physical_forecast": np.nan,
+        "correction_value": correction,
+        "lower_bound": lower_bounds,
+        "upper_bound": upper_bounds,
+        "confidence": confidence,
+        "source_station_count": clean["monitoring_post_id"].nunique(),
+        "wind_speed": speed,
+        "wind_direction": _wind_direction(local_u, local_v),
+        "wind_u": local_u,
+        "wind_v": local_v,
+        "boundary_layer_height": np.nan,
+        "diffusion_coefficient": np.nan,
+        "decay_coefficient": np.nan,
+    })
 
 
-def _deposit_bilinear(
+def _deposit_average(
     x: np.ndarray,
     y: np.ndarray,
     values: np.ndarray,
@@ -625,8 +618,9 @@ def _deposit_bilinear(
     y_min: float,
     step: float,
     shape: tuple[int, int],
-) -> np.ndarray:
-    output = np.zeros(shape, dtype=float)
+) -> tuple[np.ndarray, np.ndarray]:
+    numerator = np.zeros(shape, dtype=float)
+    denominator = np.zeros(shape, dtype=float)
     fx = (x - x_min) / step
     fy = (y - y_min) / step
     x0 = np.floor(fx).astype(int)
@@ -639,9 +633,22 @@ def _deposit_bilinear(
     ):
         xi = x0 + dx
         yi = y0 + dy
-        valid = (xi >= 0) & (xi < shape[1]) & (yi >= 0) & (yi < shape[0]) & np.isfinite(values)
-        np.add.at(output, (yi[valid], xi[valid]), values[valid] * factor[valid])
-    return output
+        valid = (
+            (xi >= 0)
+            & (xi < shape[1])
+            & (yi >= 0)
+            & (yi < shape[0])
+            & np.isfinite(values)
+        )
+        np.add.at(numerator, (yi[valid], xi[valid]), values[valid] * factor[valid])
+        np.add.at(denominator, (yi[valid], xi[valid]), factor[valid])
+    averaged = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator),
+        where=denominator > 0.0,
+    )
+    return averaged, denominator
 
 
 def build_semiphysical_forecast_grid(
@@ -653,222 +660,258 @@ def build_semiphysical_forecast_grid(
     wind_from_degrees: float | None,
     boundary_layer_height: float | None = None,
     precipitation: float | None = None,
+    duration_seconds: float = SECONDS_PER_HOUR,
 ) -> pd.DataFrame:
-    """Advance the analysed field one hour and nudge it with CatBoost station corrections."""
+    """Transport the complete field and assimilate CatBoost station corrections."""
     if analysis_grid.empty:
         return pd.DataFrame()
+    anchors = _clean_anchors(forecast_anchors)
     settings = get_settings()
     step = float(settings.GRID_CELL_METERS)
-    frames: list[pd.DataFrame] = []
-    assigned_anchors = forecast_anchors.copy()
-    if not assigned_anchors.empty and "cluster_id" not in assigned_anchors:
-        centroids = analysis_grid.groupby("cluster_id")[["latitude", "longitude"]].mean()
-        anchor_clusters: list[int] = []
-        for anchor in assigned_anchors.itertuples(index=False):
-            latitude_scale = METERS_PER_DEGREE_LATITUDE
-            longitude_scale = latitude_scale * cos(float(anchor.latitude) * pi / 180.0)
-            distances = np.hypot(
-                (centroids["latitude"].to_numpy(float) - float(anchor.latitude)) * latitude_scale,
-                (centroids["longitude"].to_numpy(float) - float(anchor.longitude)) * longitude_scale,
-            )
-            anchor_clusters.append(int(centroids.index[int(np.argmin(distances))]))
-        assigned_anchors["cluster_id"] = anchor_clusters
+    radius = float(settings.MAX_OBSERVATION_INFLUENCE_METERS)
+    duration_seconds = max(float(duration_seconds), 1.0)
+    duration_hours = duration_seconds / SECONDS_PER_HOUR
 
-    for cluster_id, source in analysis_grid.groupby("cluster_id", sort=False):
-        source = source.reset_index(drop=True)
-        reference_latitude = float(source["latitude"].mean())
-        reference_longitude = float(source["longitude"].mean())
-        source_x, source_y = _project(
-            source["latitude"].to_numpy(float), source["longitude"].to_numpy(float),
-            reference_latitude, reference_longitude,
-        )
-        anchors = assigned_anchors[assigned_anchors["cluster_id"] == cluster_id].copy()
-        speed = max(float(wind_speed or 0.0), 0.0)
-        direction = wind_from_degrees
-        pbl = (
-            float(boundary_layer_height)
-            if boundary_layer_height is not None and np.isfinite(boundary_layer_height)
-            else 500.0
-        )
-        rain = max(float(precipitation or 0.0), 0.0)
-        if not anchors.empty:
-            anchor_speeds = pd.to_numeric(
-                anchors["weather_wind_speed"]
-                if "weather_wind_speed" in anchors
-                else pd.Series(np.nan, index=anchors.index),
-                errors="coerce",
-            )
-            anchor_directions = pd.to_numeric(
-                anchors["weather_wind_direction"]
-                if "weather_wind_direction" in anchors
-                else pd.Series(np.nan, index=anchors.index),
-                errors="coerce",
-            )
-            usable_wind = anchor_speeds.notna() & anchor_directions.notna()
-            if usable_wind.any():
-                speed = max(float(anchor_speeds[usable_wind].mean()), 0.0)
-                direction_radians = np.deg2rad(anchor_directions[usable_wind].to_numpy(float))
-                direction = float((np.rad2deg(np.arctan2(
-                    np.sin(direction_radians).mean(), np.cos(direction_radians).mean()
-                )) + 360.0) % 360.0)
-            anchor_pbl = pd.to_numeric(
-                anchors["weather_boundary_layer_height"]
-                if "weather_boundary_layer_height" in anchors
-                else pd.Series(np.nan, index=anchors.index),
-                errors="coerce",
-            )
-            if anchor_pbl.notna().any():
-                pbl = float(anchor_pbl.mean())
-            anchor_rain = pd.to_numeric(
-                anchors["weather_precipitation"]
-                if "weather_precipitation" in anchors
-                else pd.Series(np.nan, index=anchors.index),
-                errors="coerce",
-            )
-            if anchor_rain.notna().any():
-                rain = max(float(anchor_rain.mean()), 0.0)
-        wind_x, wind_y = _wind_components(speed, direction)
-        displacement = min(
-            speed * float(settings.PHYSICS_TIME_STEP_SECONDS),
-            float(settings.PHYSICS_MAX_ADVECTION_METERS),
-        )
-        diffusivity = float(np.clip(
-            settings.PHYSICS_MIN_DIFFUSIVITY_M2_S + 0.012 * pbl + 1.5 * speed,
-            settings.PHYSICS_MIN_DIFFUSIVITY_M2_S,
-            settings.PHYSICS_MAX_DIFFUSIVITY_M2_S,
-        ))
-        decay = GAS_DECAY_PER_HOUR.get(substance_code, 0.05) + GAS_RAIN_SCAVENGING.get(substance_code, 0.008) * rain
-        attenuation = float(np.exp(-decay))
-        shifted_x = source_x + wind_x * displacement
-        shifted_y = source_y + wind_y * displacement
-        anchor_x = np.asarray([], dtype=float)
-        anchor_y = np.asarray([], dtype=float)
-        if not anchors.empty:
-            anchor_x, anchor_y = _project(
-                anchors["latitude"].to_numpy(float), anchors["longitude"].to_numpy(float),
-                reference_latitude, reference_longitude,
-            )
-        buffer = float(settings.GRID_BUFFER_METERS)
-        coverage_x = np.concatenate((
-            shifted_x - buffer,
-            shifted_x + buffer,
-            anchor_x - float(settings.GRID_BUFFER_METERS),
-            anchor_x + float(settings.GRID_BUFFER_METERS),
-        ))
-        coverage_y = np.concatenate((
-            shifted_y - buffer,
-            shifted_y + buffer,
-            anchor_y - float(settings.GRID_BUFFER_METERS),
-            anchor_y + float(settings.GRID_BUFFER_METERS),
-        ))
-        x_min = np.floor(coverage_x.min() / step) * step
-        x_max = np.ceil(coverage_x.max() / step) * step
-        y_min = np.floor(coverage_y.min() / step) * step
-        y_max = np.ceil(coverage_y.max() / step) * step
-        x_values = np.arange(x_min, x_max + step, step)
-        y_values = np.arange(y_min, y_max + step, step)
-        shape = (len(y_values), len(x_values))
+    latitude_values = [analysis_grid["latitude"]]
+    longitude_values = [analysis_grid["longitude"]]
+    if not anchors.empty:
+        latitude_values.append(anchors["latitude"])
+        longitude_values.append(anchors["longitude"])
+    reference_latitude = float(pd.concat(latitude_values, ignore_index=True).mean())
+    reference_longitude = float(pd.concat(longitude_values, ignore_index=True).mean())
+    source_x, source_y = _project(
+        analysis_grid["latitude"].to_numpy(float),
+        analysis_grid["longitude"].to_numpy(float),
+        reference_latitude,
+        reference_longitude,
+    )
 
-        physical = _deposit_bilinear(
-            shifted_x, shifted_y, source["value"].to_numpy(float), x_min, y_min, step, shape
+    anchor_x = np.asarray([], dtype=float)
+    anchor_y = np.asarray([], dtype=float)
+    fallback_u, fallback_v = _wind_components(wind_speed, wind_from_degrees)
+    fallback_u_value = float(np.asarray(fallback_u))
+    fallback_v_value = float(np.asarray(fallback_v))
+    if anchors.empty:
+        weather_x = np.asarray([], dtype=float)
+        weather_y = np.asarray([], dtype=float)
+        weather_u = np.asarray([], dtype=float)
+        weather_v = np.asarray([], dtype=float)
+        weather_pbl = np.asarray([], dtype=float)
+        weather_rain = np.asarray([], dtype=float)
+    else:
+        anchor_x, anchor_y = _project(
+            anchors["latitude"].to_numpy(float),
+            anchors["longitude"].to_numpy(float),
+            reference_latitude,
+            reference_longitude,
         )
-        transported_confidence = _deposit_bilinear(
-            shifted_x, shifted_y, source["confidence"].to_numpy(float), x_min, y_min, step, shape
+        weather_x, weather_y = anchor_x, anchor_y
+        weather_u, weather_v, weather_pbl, weather_rain = _anchor_weather(
+            anchors,
+            wind_speed,
+            wind_from_degrees,
+            boundary_layer_height,
+            precipitation,
         )
-        sigma_cells = max(
-            np.sqrt(2.0 * diffusivity * float(settings.PHYSICS_TIME_STEP_SECONDS)) / step,
-            0.35,
-        )
-        physical = gaussian_filter(physical, sigma=sigma_cells, mode="constant") * attenuation
-        transported_confidence = np.clip(
-            gaussian_filter(transported_confidence, sigma=sigma_cells, mode="constant")
-            * settings.PHYSICS_CONFIDENCE_RETENTION_PER_HOUR,
-            0.0,
-            1.0,
-        )
-        mesh_x, mesh_y = np.meshgrid(x_values, y_values)
-        flat_x = mesh_x.ravel()
-        flat_y = mesh_y.ravel()
-        physical_flat = physical.ravel()
-        correction = np.zeros_like(physical_flat)
 
-        if not anchors.empty:
-            physical_at_stations = physical[
-                np.clip(np.rint((anchor_y - y_min) / step).astype(int), 0, shape[0] - 1),
-                np.clip(np.rint((anchor_x - x_min) / step).astype(int), 0, shape[1] - 1),
-            ]
-            residuals = anchors["value"].to_numpy(float) - physical_at_stations
-            distances = np.hypot(
-                flat_x[:, None] - anchor_x[None, :],
-                flat_y[:, None] - anchor_y[None, :],
-            )
-            radius = float(settings.PHYSICS_CORRECTION_RADIUS_METERS)
-            weights = np.exp(-0.5 * (distances / radius) ** 2)
-            correction = _weighted_values(weights, residuals)
-            correction *= np.exp(-0.5 * (distances.min(axis=1) / radius) ** 2)
-            anchor_confidence = np.exp(-0.5 * (distances.min(axis=1) / radius) ** 2)
-            lower_bounds = _weighted_values(weights, anchors["lower_bound"].to_numpy(float))
-            upper_bounds = _weighted_values(weights, anchors["upper_bound"].to_numpy(float))
+    maximum_speed = max(
+        float(np.hypot(fallback_u_value, fallback_v_value)),
+        float(np.max(np.hypot(weather_u, weather_v))) if len(weather_u) else 0.0,
+    )
+    substeps = max(1, int(np.ceil(maximum_speed * duration_seconds / step)))
+    time_step = duration_seconds / substeps
+    transported_x = source_x.copy()
+    transported_y = source_y.copy()
+    for _ in range(substeps):
+        local_u = _interpolate_nearest_values(
+            transported_x,
+            transported_y,
+            weather_x,
+            weather_y,
+            weather_u,
+            fallback_u_value,
+        )
+        local_v = _interpolate_nearest_values(
+            transported_x,
+            transported_y,
+            weather_x,
+            weather_y,
+            weather_v,
+            fallback_v_value,
+        )
+        transported_x += local_u * time_step
+        transported_y += local_v * time_step
+
+    support_x = np.concatenate((transported_x, anchor_x)) if len(anchor_x) else transported_x
+    support_y = np.concatenate((transported_y, anchor_y)) if len(anchor_y) else transported_y
+    padding = radius if len(anchor_x) else step
+    x_values, y_values, grid_x, grid_y, x_min, y_min = _grid_extent(
+        support_x,
+        support_y,
+        step,
+        padding,
+    )
+    shape = (len(y_values), len(x_values))
+    physical, _ = _deposit_average(
+        transported_x,
+        transported_y,
+        _numeric(analysis_grid, "value", 0.0),
+        x_min,
+        y_min,
+        step,
+        shape,
+    )
+    transported_confidence, _ = _deposit_average(
+        transported_x,
+        transported_y,
+        _numeric(analysis_grid, "confidence", 0.0),
+        x_min,
+        y_min,
+        step,
+        shape,
+    )
+
+    grid_u = _interpolate_nearest_values(
+        grid_x, grid_y, weather_x, weather_y, weather_u, fallback_u_value
+    )
+    grid_v = _interpolate_nearest_values(
+        grid_x, grid_y, weather_x, weather_y, weather_v, fallback_v_value
+    )
+    pbl_default = (
+        float(boundary_layer_height)
+        if boundary_layer_height is not None and np.isfinite(boundary_layer_height)
+        else 500.0
+    )
+    rain_default = max(float(precipitation or 0.0), 0.0)
+    grid_pbl = _interpolate_nearest_values(
+        grid_x, grid_y, weather_x, weather_y, weather_pbl, pbl_default
+    )
+    grid_rain = _interpolate_nearest_values(
+        grid_x, grid_y, weather_x, weather_y, weather_rain, rain_default
+    )
+    grid_speed = np.hypot(grid_u, grid_v)
+    diffusivity = np.clip(
+        settings.PHYSICS_MIN_DIFFUSIVITY_M2_S + 0.012 * grid_pbl + 1.5 * grid_speed,
+        settings.PHYSICS_MIN_DIFFUSIVITY_M2_S,
+        settings.PHYSICS_MAX_DIFFUSIVITY_M2_S,
+    )
+    sigma_cells = max(
+        np.sqrt(2.0 * float(np.mean(diffusivity)) * duration_seconds) / step,
+        0.35,
+    )
+    physical = gaussian_filter(physical, sigma=sigma_cells, mode="constant").ravel()
+    transported_confidence = np.clip(
+        gaussian_filter(transported_confidence, sigma=sigma_cells, mode="constant").ravel()
+        * settings.PHYSICS_CONFIDENCE_RETENTION_PER_HOUR**duration_hours,
+        0.0,
+        1.0,
+    )
+    decay = (
+        GAS_DECAY_PER_HOUR.get(substance_code, 0.05)
+        + GAS_RAIN_SCAVENGING.get(substance_code, 0.008) * grid_rain
+    )
+    physical *= np.exp(-decay * duration_hours)
+
+    if anchors.empty:
+        values = physical.copy()
+        confidence = transported_confidence.copy()
+        correction = np.zeros_like(values)
+        lower_bounds = np.full_like(values, np.nan)
+        upper_bounds = np.full_like(values, np.nan)
+        station_coverage = np.zeros(len(values), dtype=bool)
+    else:
+        anchor_confidence = _observation_confidence(anchors)
+        values, confidence, correction = _optimal_interpolation(
+            grid_x,
+            grid_y,
+            physical,
+            transported_confidence,
+            anchor_x,
+            anchor_y,
+            anchors["value"].to_numpy(float),
+            anchor_confidence,
+            weather_u,
+            weather_v,
+            step,
+        )
+        lower_values = anchors["lower_bound"].to_numpy(float)
+        upper_values = anchors["upper_bound"].to_numpy(float)
+        if np.isfinite(lower_values).any():
+            usable = np.isfinite(lower_values)
+            lower_bounds = _optimal_interpolation(
+                grid_x, grid_y, physical, transported_confidence,
+                anchor_x[usable], anchor_y[usable], lower_values[usable],
+                anchor_confidence[usable], weather_u[usable], weather_v[usable], step,
+            )[0]
         else:
-            anchor_confidence = np.zeros_like(physical_flat)
-            lower_bounds = np.full_like(physical_flat, np.nan)
-            upper_bounds = np.full_like(physical_flat, np.nan)
-
-        values = np.maximum(physical_flat + correction, 0.0)
-        transported_confidence_flat = transported_confidence.ravel()
-        confidence = np.maximum(transported_confidence_flat, anchor_confidence)
-        if anchor_x.size:
-            station_distance = np.hypot(
-                flat_x[:, None] - anchor_x[None, :],
-                flat_y[:, None] - anchor_y[None, :],
-            ).min(axis=1)
-            station_coverage = station_distance <= buffer
+            lower_bounds = np.full_like(values, np.nan)
+        if np.isfinite(upper_values).any():
+            usable = np.isfinite(upper_values)
+            upper_bounds = _optimal_interpolation(
+                grid_x, grid_y, physical, transported_confidence,
+                anchor_x[usable], anchor_y[usable], upper_values[usable],
+                anchor_confidence[usable], weather_u[usable], weather_v[usable], step,
+            )[0]
         else:
-            station_coverage = np.zeros_like(values, dtype=bool)
-        transported_coverage = (
-            transported_confidence_flat >= settings.GRID_MIN_CONFIDENCE
-        )
-        significant_concentration = values >= settings.PHYSICS_MIN_CONCENTRATION
-        keep = (
-            np.isfinite(values)
-            & (confidence >= settings.GRID_MIN_CONFIDENCE)
-            & (station_coverage | (transported_coverage & significant_concentration))
-        )
-        flat_x = flat_x[keep]
-        flat_y = flat_y[keep]
-        values = values[keep]
-        physical_kept = physical_flat[keep]
-        correction = correction[keep]
-        confidence = confidence[keep]
-        lower_bounds = np.where(np.isfinite(lower_bounds[keep]), np.minimum(lower_bounds[keep], values), np.nan)
-        upper_bounds = np.where(np.isfinite(upper_bounds[keep]), np.maximum(upper_bounds[keep], values), np.nan)
-        latitudes, longitudes = _unproject(flat_x, flat_y, reference_latitude, reference_longitude)
-        south, west = _unproject(flat_x - step / 2, flat_y - step / 2, reference_latitude, reference_longitude)
-        north, east = _unproject(flat_x + step / 2, flat_y + step / 2, reference_latitude, reference_longitude)
-        frames.append(pd.DataFrame({
-            "cluster_id": int(cluster_id),
-            "grid_x": np.rint((flat_x - x_min) / step).astype(int),
-            "grid_y": np.rint((flat_y - y_min) / step).astype(int),
-            "latitude": latitudes,
-            "longitude": longitudes,
-            "south": south,
-            "west": west,
-            "north": north,
-            "east": east,
-            "value": values,
-            "analysis_value": np.nan,
-            "physical_forecast": physical_kept,
-            "correction_value": correction,
-            "lower_bound": lower_bounds,
-            "upper_bound": upper_bounds,
-            "confidence": confidence,
-            "source_station_count": int(source["source_station_count"].max()),
-            "wind_speed": speed,
-            "wind_direction": direction,
-            "wind_u": wind_x * speed,
-            "wind_v": wind_y * speed,
-            "boundary_layer_height": pbl,
-            "diffusion_coefficient": diffusivity,
-            "decay_coefficient": decay,
-        }))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            upper_bounds = np.full_like(values, np.nan)
+        station_distance = cKDTree(np.column_stack((anchor_x, anchor_y))).query(
+            np.column_stack((grid_x, grid_y)),
+            k=1,
+        )[0]
+        station_coverage = station_distance <= radius
+
+    transported_coverage = transported_confidence >= settings.GRID_MIN_CONFIDENCE
+    significant = values >= settings.PHYSICS_MIN_CONCENTRATION
+    keep = (
+        np.isfinite(values)
+        & (confidence >= settings.GRID_MIN_CONFIDENCE)
+        & (station_coverage | (transported_coverage & significant))
+    )
+    grid_x = grid_x[keep]
+    grid_y = grid_y[keep]
+    values = np.maximum(values[keep], 0.0)
+    physical_kept = np.maximum(physical[keep], 0.0)
+    correction = correction[keep]
+    confidence = confidence[keep]
+    lower_bounds = np.where(
+        np.isfinite(lower_bounds[keep]),
+        np.minimum(lower_bounds[keep], values),
+        np.nan,
+    )
+    upper_bounds = np.where(
+        np.isfinite(upper_bounds[keep]),
+        np.maximum(upper_bounds[keep], values),
+        np.nan,
+    )
+    geometry = _frame_geometry(
+        grid_x,
+        grid_y,
+        x_min,
+        y_min,
+        step,
+        reference_latitude,
+        reference_longitude,
+    )
+    source_station_count = (
+        anchors["monitoring_post_id"].nunique()
+        if not anchors.empty
+        else int(np.nanmax(_numeric(analysis_grid, "source_station_count", 0.0)))
+    )
+    return pd.DataFrame({
+        **geometry,
+        "value": values,
+        "analysis_value": np.nan,
+        "physical_forecast": physical_kept,
+        "correction_value": correction,
+        "lower_bound": lower_bounds,
+        "upper_bound": upper_bounds,
+        "confidence": confidence,
+        "source_station_count": source_station_count,
+        "wind_speed": grid_speed[keep],
+        "wind_direction": _wind_direction(grid_u[keep], grid_v[keep]),
+        "wind_u": grid_u[keep],
+        "wind_v": grid_v[keep],
+        "boundary_layer_height": grid_pbl[keep],
+        "diffusion_coefficient": diffusivity[keep],
+        "decay_coefficient": decay[keep],
+    })

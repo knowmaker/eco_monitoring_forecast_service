@@ -35,7 +35,7 @@ def _numeric(frame: pd.DataFrame, column: str, default: float | pd.Series) -> pd
 
 
 def add_physical_baseline(frame: pd.DataFrame) -> pd.DataFrame:
-    """Add a transparent one-hour transport baseline at station locations.
+    """Add a transparent transport baseline at station locations.
 
     CatBoost learns only the residual left by this baseline. The gridded
     forecast uses the same decay/rain coefficients in the transport solver.
@@ -56,13 +56,26 @@ def add_physical_baseline(frame: pd.DataFrame) -> pd.DataFrame:
         target_pbl = _numeric(
             result.loc[indexes], "target_weather_boundary_layer_height", source_pbl
         ).clip(50.0, 4000.0)
+        if {"source_bucket", "target_start"}.issubset(result.columns):
+            duration_hours = (
+                (
+                    pd.to_datetime(result.loc[indexes, "target_start"], utc=True)
+                    - pd.to_datetime(result.loc[indexes, "source_bucket"], utc=True)
+                ).dt.total_seconds()
+                / 3600.0
+            ).clip(lower=1.0)
+        else:
+            duration_hours = pd.Series(1.0, index=indexes)
 
         neighbor_blend = (wind / 12.0).clip(0.0, 0.35)
         transported = local * (1.0 - neighbor_blend) + neighbor * neighbor_blend
         vertical_mixing = np.sqrt(source_pbl / target_pbl).clip(0.45, 1.8)
         attenuation = np.exp(
-            -GAS_DECAY_PER_HOUR.get(code, 0.05)
-            -GAS_RAIN_SCAVENGING.get(code, 0.008) * rain
+            -duration_hours
+            * (
+                GAS_DECAY_PER_HOUR.get(code, 0.05)
+                + GAS_RAIN_SCAVENGING.get(code, 0.008) * rain
+            )
         )
         baselines.loc[indexes] = (transported * vertical_mixing * attenuation).clip(lower=0.0)
     result["physical_baseline"] = baselines

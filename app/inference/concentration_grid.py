@@ -41,10 +41,19 @@ def _observed_anchors(connection: Connection, substance_code: str, hour_start: d
             """
             SELECT h.monitoring_post_id, p.latitude, p.longitude,
                    GREATEST(h.filtered_hourly_mean, 0.0) AS value,
+                   h.samples_count,
                    NULL::double precision AS lower_bound,
-                   NULL::double precision AS upper_bound
+                   NULL::double precision AS upper_bound,
+                   w.wind_speed_100m AS weather_wind_speed,
+                   w.wind_direction_100m AS weather_wind_direction,
+                   w.boundary_layer_height AS weather_boundary_layer_height,
+                   w.precipitation AS weather_precipitation
             FROM public.gas_hourly_features h
             JOIN public.monitoring_posts p ON p.id = h.monitoring_post_id
+            LEFT JOIN public.external_weather_hourly w
+              ON w.monitoring_post_id = h.monitoring_post_id
+             AND w.bucket_start = h.bucket_start
+             AND w.data_kind = 'historical_forecast'
             WHERE h.substance_code = %s AND h.bucket_start = %s
               AND h.filtered_hourly_mean IS NOT NULL
               AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
@@ -191,10 +200,6 @@ def _stored_grid(
     return decode_frame(bytes(row["payload"]), row["content_sha256"])
 
 
-def _optional_float(value: object) -> float | None:
-    return float(value) if value is not None and np.isfinite(value) else None
-
-
 def _replace_grid(
     connection: Connection,
     substance_code: str,
@@ -214,10 +219,15 @@ def _replace_grid(
             connection.commit()
             return 0
         content, content_hash = encode_frame(grid)
-        station_count = int(
-            grid.groupby("cluster_id", sort=False)["source_station_count"].first().sum()
+        station_count = int(grid["source_station_count"].max())
+        mean_wind_u = float(grid["wind_u"].dropna().mean())
+        mean_wind_v = float(grid["wind_v"].dropna().mean())
+        mean_wind_speed = float(np.hypot(mean_wind_u, mean_wind_v))
+        mean_wind_direction = (
+            (degrees(atan2(mean_wind_u, mean_wind_v)) + 540.0) % 360.0
+            if mean_wind_speed > 0.0
+            else None
         )
-        first = grid.iloc[0]
         cursor.execute(
             """
             INSERT INTO public.gas_concentration_frames (
@@ -263,8 +273,8 @@ def _replace_grid(
                 float(grid["value"].min()),
                 float(grid["value"].max()),
                 station_count,
-                _optional_float(first.get("wind_speed")),
-                _optional_float(first.get("wind_direction")),
+                mean_wind_speed,
+                mean_wind_direction,
             ),
         )
     connection.commit()
@@ -393,6 +403,7 @@ def build_forecast_grid(connection: Connection, substance_code: str, hour_start:
         wind_from_degrees=weather["wind_direction"],
         boundary_layer_height=weather["boundary_layer_height"],
         precipitation=weather["precipitation"],
+        duration_seconds=(hour_start - source_hour).total_seconds() if source_hour else 3600.0,
     )
     return _replace_grid(connection, substance_code, hour_start, "forecast", grid)
 
@@ -423,6 +434,7 @@ def backfill_concentration_grids() -> dict[str, int]:
         second=0,
         microsecond=0,
     ) - timedelta(hours=settings.GRID_RETENTION_HOURS)
+    source_start = retention_start - timedelta(hours=2)
     with db_connection() as connection:
         observed_rows = fetch_all(
             connection,
@@ -430,17 +442,26 @@ def backfill_concentration_grids() -> dict[str, int]:
             SELECT h.substance_code, h.bucket_start AS hour_start,
                    h.monitoring_post_id, p.latitude, p.longitude,
                    GREATEST(h.filtered_hourly_mean, 0.0) AS value,
+                   h.samples_count,
                    NULL::double precision AS lower_bound,
-                   NULL::double precision AS upper_bound
+                   NULL::double precision AS upper_bound,
+                   w.wind_speed_100m AS weather_wind_speed,
+                   w.wind_direction_100m AS weather_wind_direction,
+                   w.boundary_layer_height AS weather_boundary_layer_height,
+                   w.precipitation AS weather_precipitation
             FROM public.gas_hourly_features h
             JOIN public.monitoring_posts p ON p.id = h.monitoring_post_id
+            LEFT JOIN public.external_weather_hourly w
+              ON w.monitoring_post_id = h.monitoring_post_id
+             AND w.bucket_start = h.bucket_start
+             AND w.data_kind = 'historical_forecast'
             WHERE h.substance_code = ANY(%s)
               AND h.bucket_start >= %s
               AND h.filtered_hourly_mean IS NOT NULL
               AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
             ORDER BY h.bucket_start, h.substance_code, h.monitoring_post_id
             """,
-            (list(settings.active_gases), retention_start),
+            (list(settings.active_gases), source_start),
         )
         forecast_rows = fetch_all(
             connection,
@@ -506,8 +527,6 @@ def backfill_concentration_grids() -> dict[str, int]:
         forecast_grids: dict[tuple[str, datetime], pd.DataFrame] = {}
         for substance_code, hour_start in sorted(observed_by_hour, key=lambda item: (item[1], item[0])):
             anchors = observed_by_hour[(substance_code, hour_start)]
-            if anchors["monitoring_post_id"].nunique() < settings.GRID_MIN_STATIONS:
-                continue
             station_ids = anchors["monitoring_post_id"].astype(int).tolist()
             wind_speed, wind_direction = _mean_wind_frame(
                 weather_by_hour,
@@ -521,7 +540,7 @@ def backfill_concentration_grids() -> dict[str, int]:
                 wind_speed=wind_speed,
                 wind_from_degrees=wind_direction,
             )
-            if not analysis_grid.empty:
+            if not analysis_grid.empty and hour_start >= retention_start:
                 counts["observed"] += _replace_grid(
                     connection,
                     substance_code,
@@ -541,10 +560,10 @@ def backfill_concentration_grids() -> dict[str, int]:
                     "live_forecast",
                     station_ids,
                 )
-                cluster_weather = weather_by_hour.get(("live_forecast", cutoff))
-                if cluster_weather is not None and not cluster_weather.empty:
+                weather_at_cutoff = weather_by_hour.get(("live_forecast", cutoff))
+                if weather_at_cutoff is not None and not weather_at_cutoff.empty:
                     forecast_anchors = forecast_anchors.merge(
-                        cluster_weather[[
+                        weather_at_cutoff[[
                             "monitoring_post_id", "wind_speed_100m", "wind_direction_100m",
                             "boundary_layer_height", "precipitation",
                         ]].rename(columns={
@@ -564,6 +583,7 @@ def backfill_concentration_grids() -> dict[str, int]:
                     wind_from_degrees=weather_values["wind_direction"],
                     boundary_layer_height=weather_values["boundary_layer_height"],
                     precipitation=weather_values["precipitation"],
+                    duration_seconds=(target_hour - hour_start).total_seconds(),
                 )
                 if not forecast_grid.empty:
                     forecast_grids[(substance_code, target_hour)] = forecast_grid

@@ -5,6 +5,8 @@ from math import asin, atan2, cos, degrees, exp, radians, sin, sqrt
 import numpy as np
 import pandas as pd
 
+from app.config import get_settings
+
 
 SPATIAL_COLUMNS = [
     "spatial_upwind_value",
@@ -13,6 +15,10 @@ SPATIAL_COLUMNS = [
     "spatial_weight_sum",
     "spatial_neighbor_count",
     "spatial_min_distance_km",
+    "backtrajectory_value",
+    "backtrajectory_distance_km",
+    "backtrajectory_travel_hours",
+    "backtrajectory_alignment",
 ]
 
 
@@ -60,6 +66,7 @@ def add_spatial_features(frame: pd.DataFrame, target_substance: str) -> pd.DataF
         values: list[float] = []
         weighted_values: list[tuple[float, float]] = []
         distances: list[float] = []
+        trajectory_values: list[tuple[float, float, float, float, float]] = []
 
         if all(np.isfinite(item) for item in (wind_direction, wind_speed, target_latitude, target_longitude)):
             for neighbor_id, location in post_locations.iterrows():
@@ -84,8 +91,17 @@ def add_spatial_features(frame: pd.DataFrame, target_substance: str) -> pd.DataF
                 values.append(float(value))
                 weighted_values.append((float(value), weight))
                 distances.append(distance_km)
+                if distance_km * 1000.0 <= get_settings().MAX_OBSERVATION_INFLUENCE_METERS:
+                    trajectory_weight = alignment * exp(
+                        -0.5
+                        * (distance_km * 1000.0 / get_settings().MAX_OBSERVATION_INFLUENCE_METERS) ** 2
+                    )
+                    trajectory_values.append(
+                        (float(value), trajectory_weight, distance_km, travel_hours, alignment)
+                    )
 
         weight_sum = sum(weight for _, weight in weighted_values)
+        trajectory_weight_sum = sum(item[1] for item in trajectory_values)
         calculated.append(
             {
                 "spatial_upwind_value": (
@@ -96,6 +112,30 @@ def add_spatial_features(frame: pd.DataFrame, target_substance: str) -> pd.DataF
                 "spatial_weight_sum": weight_sum if weighted_values else 0.0,
                 "spatial_neighbor_count": float(len(values)),
                 "spatial_min_distance_km": float(min(distances)) if distances else np.nan,
+                "backtrajectory_value": (
+                    sum(value * weight for value, weight, _, _, _ in trajectory_values)
+                    / trajectory_weight_sum
+                    if trajectory_weight_sum > 0
+                    else np.nan
+                ),
+                "backtrajectory_distance_km": (
+                    sum(distance * weight for _, weight, distance, _, _ in trajectory_values)
+                    / trajectory_weight_sum
+                    if trajectory_weight_sum > 0
+                    else np.nan
+                ),
+                "backtrajectory_travel_hours": (
+                    sum(hours * weight for _, weight, _, hours, _ in trajectory_values)
+                    / trajectory_weight_sum
+                    if trajectory_weight_sum > 0
+                    else np.nan
+                ),
+                "backtrajectory_alignment": (
+                    sum(alignment * weight for _, weight, _, _, alignment in trajectory_values)
+                    / trajectory_weight_sum
+                    if trajectory_weight_sum > 0
+                    else np.nan
+                ),
             }
         )
 

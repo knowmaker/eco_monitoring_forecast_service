@@ -3,7 +3,6 @@ import pandas as pd
 
 from app.features.concentration_grid import (
     assimilate_observations,
-    build_concentration_grid,
     build_semiphysical_forecast_grid,
 )
 
@@ -47,99 +46,165 @@ def _anchors() -> pd.DataFrame:
     )
 
 
-def test_grid_builds_separate_area_for_isolated_station():
-    grid = build_concentration_grid(
+def _offset(latitude: float, longitude: float, east_m: float, north_m: float) -> tuple[float, float]:
+    return (
+        latitude + north_m / 111_320.0,
+        longitude + east_m / (111_320.0 * np.cos(np.deg2rad(latitude))),
+    )
+
+
+def _nearest_row(frame: pd.DataFrame, latitude: float, longitude: float) -> pd.Series:
+    north = (frame["latitude"] - latitude) * 111_320.0
+    east = (
+        (frame["longitude"] - longitude)
+        * 111_320.0
+        * np.cos(np.deg2rad(latitude))
+    )
+    return frame.iloc[int(np.argmin(np.hypot(east, north)))]
+
+
+def test_analysis_uses_one_field_without_cluster_identifiers():
+    analysis = assimilate_observations(
         _anchors(),
-        data_kind="observed",
+        None,
         wind_speed=2.0,
         wind_from_degrees=270.0,
     )
 
-    assert not grid.empty
-    assert set(grid["cluster_id"]) == {1, 4}
-    assert set(grid["source_station_count"]) == {1, 3}
-    assert grid["confidence"].between(0.0, 1.0).all()
-    assert (grid["south"] < grid["north"]).all()
-    assert (grid["west"] < grid["east"]).all()
+    assert not analysis.empty
+    assert "cluster_id" not in analysis
+    assert set(analysis["source_station_count"]) == {4}
+    assert analysis["confidence"].between(0.0, 1.0).all()
+    assert (analysis["south"] < analysis["north"]).all()
+    assert (analysis["west"] < analysis["east"]).all()
 
 
-def test_forecast_grid_preserves_nonnegative_values_and_intervals():
-    grid = build_concentration_grid(
-        _anchors().iloc[:3],
-        data_kind="forecast",
-        wind_speed=3.0,
-        wind_from_degrees=180.0,
-    )
-
-    assert (grid["value"] >= 0.0).all()
-    assert (grid["lower_bound"] <= grid["value"]).all()
-    assert (grid["upper_bound"] >= grid["value"]).all()
-
-
-def test_forecast_grid_extends_in_transport_direction():
-    anchors = _anchors().iloc[:3].copy()
-    source = anchors.copy()
-    source["value"] = [0.12, 0.02, 0.02]
-
-    calm_grid = build_concentration_grid(
-        anchors,
-        data_kind="forecast",
-        source_anchors=source,
-    )
-    wind_grid = build_concentration_grid(
-        anchors,
-        data_kind="forecast",
-        wind_speed=4.0,
-        wind_from_degrees=270.0,
-        source_anchors=source,
-    )
-
-    assert wind_grid["east"].max() > calm_grid["east"].max()
-    assert wind_grid.loc[wind_grid["longitude"] > calm_grid["east"].max(), "value"].notna().any()
-
-
-def test_forecast_grid_uses_predictions_when_recent_observations_are_missing():
-    anchors = _anchors().iloc[:3].copy()
-
-    calm_grid = build_concentration_grid(anchors, data_kind="forecast")
-    wind_grid = build_concentration_grid(
-        anchors,
-        data_kind="forecast",
-        wind_speed=4.0,
-        wind_from_degrees=270.0,
-    )
-
-    assert wind_grid["east"].max() > calm_grid["east"].max()
-
-
-def test_grid_clips_negative_concentrations_instead_of_creating_mass():
-    anchors = _anchors().iloc[:1].copy()
-    anchors["value"] = -0.12
-
-    grid = build_concentration_grid(anchors, data_kind="observed")
-
-    assert (grid["value"] >= 0.0).all()
-    assert grid["value"].max() == 0.0
-    assert grid["value"].nunique() == 1
-    assert (grid["north"].max() - anchors.iloc[0].latitude) * 111_320 > 900
-
-
-def test_single_station_grid_has_rounded_coverage():
-    anchors = _anchors().iloc[:1].copy()
-
-    grid = build_concentration_grid(anchors, data_kind="observed")
-
-    latitude = float(anchors.iloc[0].latitude)
-    longitude = float(anchors.iloc[0].longitude)
-    northing = (grid["latitude"] - latitude) * 111_320.0
-    easting = (
-        (grid["longitude"] - longitude)
+def test_single_station_influence_never_exceeds_ten_kilometers():
+    anchor = _anchors().iloc[:1]
+    analysis = assimilate_observations(anchor, None)
+    latitude = float(anchor.iloc[0].latitude)
+    longitude = float(anchor.iloc[0].longitude)
+    north = (analysis["latitude"] - latitude) * 111_320.0
+    east = (
+        (analysis["longitude"] - longitude)
         * 111_320.0
         * np.cos(np.deg2rad(latitude))
     )
-    distances = np.hypot(easting, northing)
-    assert distances.max() <= 1500.01
-    assert len(grid) < 31 * 31
+    distances = np.hypot(east, north)
+
+    assert distances.max() <= 10_000.01
+    assert distances.max() > 5_000.0
+
+
+def test_observation_influence_is_longer_along_wind_than_across_it():
+    anchor = _anchors().iloc[:1].copy()
+    anchor["weather_wind_speed"] = 5.0
+    anchor["weather_wind_direction"] = 270.0
+    analysis = assimilate_observations(anchor, None)
+    latitude = float(anchor.iloc[0].latitude)
+    longitude = float(anchor.iloc[0].longitude)
+    north = np.abs((analysis["latitude"] - latitude) * 111_320.0)
+    east = np.abs(
+        (analysis["longitude"] - longitude)
+        * 111_320.0
+        * np.cos(np.deg2rad(latitude))
+    )
+
+    assert east.max() > north.max()
+
+
+def test_stations_with_overlapping_influence_have_a_field_between_them():
+    latitude = 55.75
+    longitude = 37.6
+    second_latitude, second_longitude = _offset(latitude, longitude, 15_000.0, 0.0)
+    anchors = pd.DataFrame([
+        {"monitoring_post_id": 1, "latitude": latitude, "longitude": longitude, "value": 0.02},
+        {
+            "monitoring_post_id": 2,
+            "latitude": second_latitude,
+            "longitude": second_longitude,
+            "value": 0.10,
+        },
+    ])
+
+    analysis = assimilate_observations(anchors, None)
+    middle_latitude, middle_longitude = _offset(latitude, longitude, 7_500.0, 0.0)
+    middle = _nearest_row(analysis, middle_latitude, middle_longitude)
+
+    assert 0.02 < middle["value"] < 0.10
+    assert middle["confidence"] > 0.0
+
+
+def test_stations_farther_than_two_influence_radii_leave_a_gap():
+    latitude = 55.75
+    longitude = 37.6
+    second_latitude, second_longitude = _offset(latitude, longitude, 25_000.0, 0.0)
+    anchors = pd.DataFrame([
+        {"monitoring_post_id": 1, "latitude": latitude, "longitude": longitude, "value": 0.02},
+        {
+            "monitoring_post_id": 2,
+            "latitude": second_latitude,
+            "longitude": second_longitude,
+            "value": 0.10,
+        },
+    ])
+
+    analysis = assimilate_observations(anchors, None)
+    middle_latitude, middle_longitude = _offset(latitude, longitude, 12_500.0, 0.0)
+    middle = _nearest_row(analysis, middle_latitude, middle_longitude)
+    north = (middle["latitude"] - middle_latitude) * 111_320.0
+    east = (
+        (middle["longitude"] - middle_longitude)
+        * 111_320.0
+        * np.cos(np.deg2rad(middle_latitude))
+    )
+
+    assert np.hypot(east, north) > 1_000.0
+
+
+def test_negative_observation_does_not_create_concentration_mass():
+    anchors = _anchors().iloc[:1].copy()
+    anchors["value"] = -0.12
+
+    analysis = assimilate_observations(anchors, None)
+
+    assert (analysis["value"] >= 0.0).all()
+    assert analysis["value"].max() == 0.0
+
+
+def test_forecast_moves_field_by_wind_without_fixed_distance_cap():
+    anchors = _anchors().iloc[:1].copy()
+    analysis = assimilate_observations(anchors, None)
+    forecast_anchors = anchors.copy()
+    forecast_anchors["weather_wind_speed"] = 4.0
+    forecast_anchors["weather_wind_direction"] = 270.0
+    forecast = build_semiphysical_forecast_grid(
+        analysis,
+        forecast_anchors,
+        substance_code="NO2",
+        wind_speed=4.0,
+        wind_from_degrees=270.0,
+    )
+
+    assert forecast["east"].max() > analysis["east"].max() + 0.08
+
+
+def test_forecast_uses_spatially_varying_wind_vectors():
+    anchors = _anchors().iloc[:2].copy()
+    analysis = assimilate_observations(anchors, None)
+    forecast_anchors = anchors.copy()
+    forecast_anchors["weather_wind_speed"] = [3.0, 3.0]
+    forecast_anchors["weather_wind_direction"] = [270.0, 90.0]
+    forecast = build_semiphysical_forecast_grid(
+        analysis,
+        forecast_anchors,
+        substance_code="NO2",
+        wind_speed=3.0,
+        wind_from_degrees=270.0,
+    )
+
+    assert forecast["wind_u"].min() < 0.0
+    assert forecast["wind_u"].max() > 0.0
 
 
 def test_semiphysical_forecast_stores_physical_and_statistical_components():
@@ -171,6 +236,32 @@ def test_semiphysical_forecast_stores_physical_and_statistical_components():
     assert (forecast["value"] >= 0).all()
 
 
+def test_analysis_spreads_forecast_error_upwind():
+    anchor = _anchors().iloc[:1].copy()
+    anchor["weather_wind_speed"] = 4.0
+    anchor["weather_wind_direction"] = 270.0
+    initial = anchor.copy()
+    initial["value"] = 0.02
+    prior = build_semiphysical_forecast_grid(
+        assimilate_observations(initial, None),
+        initial,
+        substance_code="NO2",
+        wind_speed=0.0,
+        wind_from_degrees=270.0,
+    )
+    anchor["value"] = 0.10
+
+    analysis = assimilate_observations(anchor, prior)
+    latitude = float(anchor.iloc[0].latitude)
+    longitude = float(anchor.iloc[0].longitude)
+    west_latitude, west_longitude = _offset(latitude, longitude, -8_000.0, 0.0)
+    east_latitude, east_longitude = _offset(latitude, longitude, 8_000.0, 0.0)
+    west = _nearest_row(analysis, west_latitude, west_longitude)
+    east = _nearest_row(analysis, east_latitude, east_longitude)
+
+    assert west["correction_value"] > east["correction_value"]
+
+
 def test_analysis_preserves_previous_forecast_footprint():
     anchors = _anchors().iloc[:1].copy()
     initial_analysis = assimilate_observations(anchors, None)
@@ -185,27 +276,3 @@ def test_analysis_preserves_previous_forecast_footprint():
     next_analysis = assimilate_observations(anchors, prior_forecast)
 
     assert next_analysis["east"].max() >= prior_forecast["east"].max() - 0.0001
-    assert next_analysis["east"].max() > initial_analysis["east"].max()
-
-
-def test_transport_expands_footprint_across_successive_hours():
-    anchors = _anchors().iloc[:1].copy()
-    first_analysis = assimilate_observations(anchors, None)
-    first_forecast = build_semiphysical_forecast_grid(
-        first_analysis,
-        anchors,
-        substance_code="NO2",
-        wind_speed=4.0,
-        wind_from_degrees=270.0,
-    )
-    second_analysis = assimilate_observations(anchors, first_forecast)
-    second_forecast = build_semiphysical_forecast_grid(
-        second_analysis,
-        anchors,
-        substance_code="NO2",
-        wind_speed=4.0,
-        wind_from_degrees=270.0,
-    )
-
-    assert second_forecast["east"].max() > first_forecast["east"].max()
-    assert second_forecast["confidence"].between(0.0, 1.0).all()

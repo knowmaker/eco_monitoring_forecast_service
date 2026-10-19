@@ -9,7 +9,6 @@ import pandas as pd
 
 FRAME_FORMAT_VERSION = 1
 FRAME_COLUMNS = {
-    "cluster_id": np.int64,
     "grid_x": np.int32,
     "grid_y": np.int32,
     "latitude": np.float64,
