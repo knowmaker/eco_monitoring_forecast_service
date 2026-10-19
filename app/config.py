@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(validation_alias=AliasChoices("DATABASE_URL", "DB_DSN"))
     APP_TIMEZONE: str = "Europe/Moscow"
     FORECAST_RUN_MINUTE: int = Field(default=10, ge=0, le=59)
-    FORECAST_CATCHUP_HOURS: int = Field(default=24, ge=1, le=168)
+    FORECAST_CATCHUP_HOURS: int = Field(default=72, ge=1, le=168)
     FEATURE_LOOKBACK_HOURS: int = Field(default=72, ge=24)
     ACTIVE_GASES: str = "CO,NO,NO2,O3,SO2"
     ARTIFACTS_DIR: Path = SERVICE_ROOT / "artifacts"
@@ -33,14 +33,14 @@ class Settings(BaseSettings):
     OPEN_METEO_FORECAST_URL: str = "https://api.open-meteo.com/v1/forecast"
     OPEN_METEO_HISTORICAL_FORECAST_URL: str = "https://historical-forecast-api.open-meteo.com/v1/forecast"
     OPEN_METEO_TIMEOUT_SECONDS: int = Field(default=30, ge=5, le=120)
-    GRID_CELL_METERS: int = Field(default=100, ge=25, le=500)
+    GRID_CELL_METERS: int = Field(default=500, ge=25, le=1000)
     GRID_BUFFER_METERS: int = Field(default=1500, ge=100, le=5000)
     GRID_CLUSTER_DISTANCE_METERS: int = Field(default=5000, ge=500, le=50000)
     GRID_MIN_STATIONS: int = Field(default=1, ge=1, le=20)
     GRID_MAX_ADVECTION_METERS: int = Field(default=1500, ge=0, le=10000)
     GRID_TRANSPORT_BLEND: float = Field(default=0.25, ge=0, le=1)
     GRID_MIN_CONFIDENCE: float = Field(default=0.04, ge=0, le=1)
-    GRID_RETENTION_DAYS: int = Field(default=7, ge=1, le=366)
+    GRID_RETENTION_HOURS: int = Field(default=72, ge=1, le=24 * 366)
     PHYSICS_TIME_STEP_SECONDS: int = Field(default=3600, ge=60, le=3600)
     PHYSICS_MAX_ADVECTION_METERS: int = Field(default=1500, ge=100, le=20000)
     PHYSICS_ASSIMILATION_RADIUS_METERS: int = Field(default=600, ge=100, le=5000)

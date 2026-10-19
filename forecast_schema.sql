@@ -76,42 +76,35 @@ CREATE TABLE public.gas_predictions (
     PRIMARY KEY (monitoring_post_id, substance_code, target_start)
 );
 
-CREATE INDEX idx_forecast_predictions_heatmap
+CREATE INDEX idx_forecast_predictions_concentration_map
     ON public.gas_predictions (substance_code, target_start DESC, monitoring_post_id);
 
-CREATE TABLE public.gas_concentration_grid (
+CREATE TABLE public.gas_concentration_frames (
+    id BIGSERIAL PRIMARY KEY,
     substance_code TEXT NOT NULL,
     hour_start TIMESTAMPTZ NOT NULL,
     data_kind TEXT NOT NULL CHECK (data_kind IN ('observed', 'forecast')),
-    cluster_id BIGINT NOT NULL,
-    grid_x INTEGER NOT NULL,
-    grid_y INTEGER NOT NULL,
-    latitude DOUBLE PRECISION NOT NULL,
-    longitude DOUBLE PRECISION NOT NULL,
+    payload BYTEA NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    cell_count INTEGER NOT NULL CHECK (cell_count > 0),
+    cell_size_meters INTEGER NOT NULL CHECK (cell_size_meters > 0),
     south DOUBLE PRECISION NOT NULL,
     west DOUBLE PRECISION NOT NULL,
     north DOUBLE PRECISION NOT NULL,
     east DOUBLE PRECISION NOT NULL,
-    value DOUBLE PRECISION NOT NULL,
-    analysis_value DOUBLE PRECISION,
-    physical_forecast DOUBLE PRECISION,
-    correction_value DOUBLE PRECISION,
-    lower_bound DOUBLE PRECISION,
-    upper_bound DOUBLE PRECISION,
-    confidence DOUBLE PRECISION NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    value_min DOUBLE PRECISION NOT NULL,
+    value_max DOUBLE PRECISION NOT NULL,
     source_station_count INTEGER NOT NULL CHECK (source_station_count >= 1),
     wind_speed DOUBLE PRECISION,
     wind_direction DOUBLE PRECISION,
-    wind_u DOUBLE PRECISION,
-    wind_v DOUBLE PRECISION,
-    boundary_layer_height DOUBLE PRECISION,
-    diffusion_coefficient DOUBLE PRECISION,
-    decay_coefficient DOUBLE PRECISION,
     generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (substance_code, hour_start, data_kind, cluster_id, grid_x, grid_y)
+    UNIQUE (substance_code, hour_start, data_kind),
+    CHECK (south < north),
+    CHECK (west < east),
+    CHECK (value_min <= value_max)
 );
 
-CREATE INDEX idx_gas_concentration_grid_timeline
-    ON public.gas_concentration_grid (substance_code, hour_start DESC, data_kind);
+CREATE INDEX idx_gas_concentration_frames_timeline
+    ON public.gas_concentration_frames (substance_code, hour_start DESC, data_kind);
 
 COMMIT;

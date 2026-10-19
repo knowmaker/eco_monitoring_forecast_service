@@ -9,28 +9,12 @@ import numpy as np
 import pandas as pd
 from psycopg import Connection
 
+from app.concentration_frame import decode_frame, encode_frame
 from app.config import get_settings
 from app.db import db_connection, fetch_all, fetch_one
 from app.features.concentration_grid import (
     assimilate_observations,
     build_semiphysical_forecast_grid,
-)
-
-
-GRID_COPY_SQL = """
-    COPY public.gas_concentration_grid (
-        substance_code, hour_start, data_kind, cluster_id, grid_x, grid_y,
-        latitude, longitude, south, west, north, east, value,
-        analysis_value, physical_forecast, correction_value,
-        lower_bound, upper_bound, confidence, source_station_count,
-        wind_speed, wind_direction, wind_u, wind_v, boundary_layer_height,
-        diffusion_coefficient, decay_coefficient
-    )
-    FROM STDIN
-"""
-GRID_STAGE_COPY_SQL = GRID_COPY_SQL.replace(
-    "public.gas_concentration_grid",
-    "gas_concentration_grid_stage",
 )
 
 
@@ -193,20 +177,22 @@ def _stored_grid(
     hour_start: datetime,
     data_kind: str,
 ) -> pd.DataFrame:
-    return pd.DataFrame(fetch_all(
+    row = fetch_one(
         connection,
         """
-        SELECT cluster_id, grid_x, grid_y, latitude, longitude, south, west, north, east,
-               value, analysis_value, physical_forecast, correction_value,
-               lower_bound, upper_bound, confidence, source_station_count,
-               wind_speed, wind_direction, wind_u, wind_v, boundary_layer_height,
-               diffusion_coefficient, decay_coefficient
-        FROM public.gas_concentration_grid
+        SELECT payload, content_sha256
+        FROM public.gas_concentration_frames
         WHERE substance_code = %s AND hour_start = %s AND data_kind = %s
-        ORDER BY cluster_id, grid_y, grid_x
         """,
         (substance_code, hour_start, data_kind),
-    ))
+    )
+    if row is None:
+        return pd.DataFrame()
+    return decode_frame(bytes(row["payload"]), row["content_sha256"])
+
+
+def _optional_float(value: object) -> float | None:
+    return float(value) if value is not None and np.isfinite(value) else None
 
 
 def _replace_grid(
@@ -217,77 +203,72 @@ def _replace_grid(
     grid: pd.DataFrame,
 ) -> int:
     with connection.cursor() as cursor:
+        if grid.empty:
+            cursor.execute(
+                """
+                DELETE FROM public.gas_concentration_frames
+                WHERE substance_code = %s AND hour_start = %s AND data_kind = %s
+                """,
+                (substance_code, hour_start, data_kind),
+            )
+            connection.commit()
+            return 0
+        content, content_hash = encode_frame(grid)
+        station_count = int(
+            grid.groupby("cluster_id", sort=False)["source_station_count"].first().sum()
+        )
+        first = grid.iloc[0]
         cursor.execute(
             """
-            DELETE FROM public.gas_concentration_grid
-            WHERE substance_code = %s AND hour_start = %s AND data_kind = %s
+            INSERT INTO public.gas_concentration_frames (
+                substance_code, hour_start, data_kind, payload, content_sha256,
+                cell_count, cell_size_meters,
+                south, west, north, east, value_min, value_max,
+                source_station_count, wind_speed, wind_direction, generated_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, NOW()
+            )
+            ON CONFLICT (substance_code, hour_start, data_kind) DO UPDATE SET
+                payload = EXCLUDED.payload,
+                content_sha256 = EXCLUDED.content_sha256,
+                cell_count = EXCLUDED.cell_count,
+                cell_size_meters = EXCLUDED.cell_size_meters,
+                south = EXCLUDED.south,
+                west = EXCLUDED.west,
+                north = EXCLUDED.north,
+                east = EXCLUDED.east,
+                value_min = EXCLUDED.value_min,
+                value_max = EXCLUDED.value_max,
+                source_station_count = EXCLUDED.source_station_count,
+                wind_speed = EXCLUDED.wind_speed,
+                wind_direction = EXCLUDED.wind_direction,
+                generated_at = EXCLUDED.generated_at
             """,
-            (substance_code, hour_start, data_kind),
-        )
-        if grid.empty:
-            return 0
-        with cursor.copy(GRID_COPY_SQL) as copy:
-            _write_grid_rows(copy, substance_code, hour_start, data_kind, grid)
-    return len(grid)
-
-
-def _write_grid_rows(
-    copy: Any,
-    substance_code: str,
-    hour_start: datetime,
-    data_kind: str,
-    grid: pd.DataFrame,
-) -> None:
-    def optional_float(row: Any, name: str) -> float | None:
-        value = getattr(row, name, np.nan)
-        return float(value) if value is not None and np.isfinite(value) else None
-
-    for row in grid.itertuples(index=False):
-        copy.write_row(
             (
                 substance_code,
                 hour_start,
                 data_kind,
-                int(row.cluster_id),
-                int(row.grid_x),
-                int(row.grid_y),
-                float(row.latitude),
-                float(row.longitude),
-                float(row.south),
-                float(row.west),
-                float(row.north),
-                float(row.east),
-                float(row.value),
-                optional_float(row, "analysis_value"),
-                optional_float(row, "physical_forecast"),
-                optional_float(row, "correction_value"),
-                optional_float(row, "lower_bound"),
-                optional_float(row, "upper_bound"),
-                float(row.confidence),
-                int(row.source_station_count),
-                optional_float(row, "wind_speed"),
-                optional_float(row, "wind_direction"),
-                optional_float(row, "wind_u"),
-                optional_float(row, "wind_v"),
-                optional_float(row, "boundary_layer_height"),
-                optional_float(row, "diffusion_coefficient"),
-                optional_float(row, "decay_coefficient"),
-            )
+                content,
+                content_hash,
+                len(grid),
+                get_settings().GRID_CELL_METERS,
+                float(grid["south"].min()),
+                float(grid["west"].min()),
+                float(grid["north"].max()),
+                float(grid["east"].max()),
+                float(grid["value"].min()),
+                float(grid["value"].max()),
+                station_count,
+                _optional_float(first.get("wind_speed")),
+                _optional_float(first.get("wind_direction")),
+            ),
         )
-
-
-def _insert_grid_batch(
-    connection: Connection,
-    batch: list[tuple[str, datetime, str, pd.DataFrame]],
-    copy_sql: str = GRID_COPY_SQL,
-) -> None:
-    if not batch:
-        return
-    with connection.cursor() as cursor:
-        with cursor.copy(copy_sql) as copy:
-            for substance_code, hour_start, data_kind, grid in batch:
-                _write_grid_rows(copy, substance_code, hour_start, data_kind, grid)
     connection.commit()
+    return len(grid)
 
 
 def _mean_wind_frame(
@@ -424,12 +405,13 @@ def refresh_concentration_grids(cutoff: datetime) -> dict[str, int]:
         for substance_code in get_settings().active_gases:
             counts["observed"] += build_observed_grid(connection, substance_code, observed_hour)
             counts["forecast"] += build_forecast_grid(connection, substance_code, forecast_hour)
-        retention_start = cutoff - timedelta(days=get_settings().GRID_RETENTION_DAYS)
+        retention_start = cutoff - timedelta(hours=get_settings().GRID_RETENTION_HOURS)
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM public.gas_concentration_grid WHERE hour_start < %s",
+                "DELETE FROM public.gas_concentration_frames WHERE hour_start < %s",
                 (retention_start,),
             )
+        connection.commit()
     return counts
 
 
@@ -440,7 +422,7 @@ def backfill_concentration_grids() -> dict[str, int]:
         minute=0,
         second=0,
         microsecond=0,
-    ) - timedelta(days=settings.GRID_RETENTION_DAYS)
+    ) - timedelta(hours=settings.GRID_RETENTION_HOURS)
     with db_connection() as connection:
         observed_rows = fetch_all(
             connection,
@@ -521,17 +503,6 @@ def backfill_concentration_grids() -> dict[str, int]:
             )
         } if not forecast.empty else {}
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TEMP TABLE gas_concentration_grid_stage
-                (LIKE public.gas_concentration_grid INCLUDING DEFAULTS)
-                ON COMMIT PRESERVE ROWS
-                """
-            )
-        connection.commit()
-
-        batch: list[tuple[str, datetime, str, pd.DataFrame]] = []
         forecast_grids: dict[tuple[str, datetime], pd.DataFrame] = {}
         for substance_code, hour_start in sorted(observed_by_hour, key=lambda item: (item[1], item[0])):
             anchors = observed_by_hour[(substance_code, hour_start)]
@@ -551,8 +522,13 @@ def backfill_concentration_grids() -> dict[str, int]:
                 wind_from_degrees=wind_direction,
             )
             if not analysis_grid.empty:
-                batch.append((substance_code, hour_start, "observed", analysis_grid))
-                counts["observed"] += len(analysis_grid)
+                counts["observed"] += _replace_grid(
+                    connection,
+                    substance_code,
+                    hour_start,
+                    "observed",
+                    analysis_grid,
+                )
             forecast_anchors = forecast_by_source.get((substance_code, hour_start))
             if forecast_anchors is not None and not forecast_anchors.empty and not analysis_grid.empty:
                 forecast_anchors = forecast_anchors.copy()
@@ -591,26 +567,18 @@ def backfill_concentration_grids() -> dict[str, int]:
                 )
                 if not forecast_grid.empty:
                     forecast_grids[(substance_code, target_hour)] = forecast_grid
-                    batch.append((substance_code, target_hour, "forecast", forecast_grid))
-                    counts["forecast"] += len(forecast_grid)
-            if len(batch) >= 25:
-                _insert_grid_batch(connection, batch, GRID_STAGE_COPY_SQL)
-                batch.clear()
-        _insert_grid_batch(connection, batch, GRID_STAGE_COPY_SQL)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM public.gas_concentration_grid WHERE substance_code = ANY(%s)",
-                (list(settings.active_gases),),
-            )
-            cursor.execute(
-                "INSERT INTO public.gas_concentration_grid SELECT * FROM gas_concentration_grid_stage"
-            )
+                    counts["forecast"] += _replace_grid(
+                        connection,
+                        substance_code,
+                        target_hour,
+                        "forecast",
+                        forecast_grid,
+                    )
     return counts
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build gas concentration grids for the heat map.")
+    parser = argparse.ArgumentParser(description="Build and store gas concentration frames.")
     parser.add_argument("--backfill", action="store_true")
     parser.add_argument("--cutoff", help="Optional ISO-8601 data cutoff.")
     args = parser.parse_args()

@@ -37,10 +37,10 @@ def run_forecast(
             except Exception as error:
                 logger.warning("Open-Meteo synchronisation failed: %s", error)
     predictions = predict_all_stations(resolved_cutoff)
-    grid_cells = refresh_concentration_grids(resolved_cutoff)
+    frame_cells = refresh_concentration_grids(resolved_cutoff)
     return {
         "status": "completed", "data_cutoff": resolved_cutoff.isoformat(),
         "hourly_rows": hourly_rows, "weather_rows": weather_rows,
         "predictions": predictions,
-        "grid_cells": grid_cells,
+        "frame_cells": frame_cells,
     }

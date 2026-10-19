@@ -90,7 +90,7 @@ def missing_grid_cutoffs(due_cutoff: datetime) -> list[datetime]:
             connection,
             """
             SELECT hour_start, data_kind, substance_code
-            FROM public.gas_concentration_grid
+            FROM public.gas_concentration_frames
             WHERE substance_code = ANY(%s)
               AND hour_start >= %s
               AND hour_start <= %s
