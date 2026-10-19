@@ -39,7 +39,7 @@ def _analysis_anchors(connection: Connection, substance_code: str, hour_start: d
         fetch_all(
             connection,
             """
-            SELECT h.monitoring_post_id, p.latitude, p.longitude,
+            SELECT h.monitoring_post_id, p.latitude, p.longitude, p.source,
                    GREATEST(h.filtered_hourly_mean, 0.0) AS value,
                    h.samples_count,
                    NULL::double precision AS lower_bound,
@@ -534,7 +534,7 @@ def backfill_concentration_grids() -> dict[str, int]:
             connection,
             """
             SELECT h.substance_code, h.bucket_start AS hour_start,
-                   h.monitoring_post_id, p.latitude, p.longitude,
+                   h.monitoring_post_id, p.latitude, p.longitude, p.source,
                    GREATEST(h.filtered_hourly_mean, 0.0) AS value,
                    h.samples_count,
                    NULL::double precision AS lower_bound,

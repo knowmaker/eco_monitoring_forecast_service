@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     OPEN_METEO_TIMEOUT_SECONDS: int = Field(default=30, ge=5, le=120)
     GRID_CELL_METERS: int = Field(default=500, ge=25, le=1000)
     MAX_OBSERVATION_INFLUENCE_METERS: int = Field(default=10000, ge=500, le=50000)
-    GRID_MIN_CONFIDENCE: float = Field(default=0.04, ge=0, le=1)
+    GRID_MIN_CONFIDENCE: float = Field(default=0.02, ge=0, le=1)
     GRID_RETENTION_HOURS: int = Field(default=72, ge=1, le=24 * 366)
     PHYSICS_MIN_DIFFUSIVITY_M2_S: float = Field(default=4.0, gt=0, le=500)
     PHYSICS_MAX_DIFFUSIVITY_M2_S: float = Field(default=40.0, gt=0, le=1000)

@@ -14,6 +14,7 @@ from app.features.physical_baseline import GAS_DECAY_PER_HOUR, GAS_RAIN_SCAVENGI
 METERS_PER_DEGREE_LATITUDE = 111_320.0
 SECONDS_PER_HOUR = 3600.0
 COVARIANCE_AT_RADIUS = 0.05
+MOSECOM_AGGREGATE_EFFECTIVE_SAMPLES = 3.0
 
 
 def _project(
@@ -102,6 +103,12 @@ def _observation_confidence(anchors: pd.DataFrame) -> np.ndarray:
 
     samples = _numeric(anchors, "samples_count")
     if np.isfinite(samples).any():
+        if "source" in anchors:
+            samples = np.where(
+                anchors["source"].eq("mosecom"),
+                MOSECOM_AGGREGATE_EFFECTIVE_SAMPLES,
+                samples,
+            )
         maximum = max(float(np.nanmax(samples)), 1.0)
         sample_confidence = np.clip(samples / maximum, 0.05, 1.0)
         confidence = np.where(np.isfinite(confidence), confidence, sample_confidence)

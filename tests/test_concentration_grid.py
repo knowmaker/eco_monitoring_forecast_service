@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from app.features.concentration_grid import (
+    _observation_confidence,
     assimilate_observations,
     build_semiphysical_forecast_grid,
 )
@@ -48,6 +49,16 @@ def _anchors() -> pd.DataFrame:
             },
         ]
     )
+
+
+def test_mosecom_aggregate_has_three_effective_samples_only_in_grid_confidence():
+    anchors = pd.DataFrame({
+        "samples_count": [1, 9],
+        "source": ["mosecom", "internal"],
+    })
+
+    np.testing.assert_allclose(_observation_confidence(anchors), [1 / 3, 1])
+    assert anchors["samples_count"].tolist() == [1, 9]
 
 
 def _offset(latitude: float, longitude: float, east_m: float, north_m: float) -> tuple[float, float]:
@@ -356,12 +367,21 @@ def test_analysis_spreads_forecast_error_upwind():
     analysis = assimilate_observations(anchor, prior)
     latitude = float(anchor.iloc[0].latitude)
     longitude = float(anchor.iloc[0].longitude)
-    west_latitude, west_longitude = _offset(latitude, longitude, -8_000.0, 0.0)
-    east_latitude, east_longitude = _offset(latitude, longitude, 8_000.0, 0.0)
-    west = _nearest_row(analysis, west_latitude, west_longitude)
-    east = _nearest_row(analysis, east_latitude, east_longitude)
+    east_meters = (
+        (analysis["longitude"] - longitude)
+        * 111_320.0
+        * np.cos(np.deg2rad(latitude))
+    )
+    north_meters = (analysis["latitude"] - latitude) * 111_320.0
+    west = analysis.loc[
+        ((east_meters + 8_000.0).abs() < 500.0) & (north_meters.abs() < 500.0)
+    ]
+    east = analysis.loc[
+        ((east_meters - 8_000.0).abs() < 500.0) & (north_meters.abs() < 500.0)
+    ]
 
-    assert west["correction_value"] > east["correction_value"]
+    assert not west.empty and not east.empty
+    assert west["correction_value"].mean() > east["correction_value"].mean()
 
 
 def test_analysis_preserves_previous_forecast_footprint():
