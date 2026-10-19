@@ -20,9 +20,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 def _cutoffs_to_rebuild(
     expected: list[dict[str, object]],
     existing: list[dict[str, object]],
+    due_cutoff: datetime,
 ) -> list[datetime]:
-    existing_keys = {
-        (row["hour_start"], row["data_kind"], row["substance_code"])
+    existing_frames = {
+        (row["hour_start"], row["data_kind"], row["substance_code"]): row.get("generated_at")
         for row in existing
     }
     eligible_cutoffs: set[datetime] = set()
@@ -35,9 +36,24 @@ def _cutoffs_to_rebuild(
         cutoff = source_hour + timedelta(hours=1)
         eligible_cutoffs.add(cutoff)
         analysis_key = (source_hour, "analysis", substance_code)
+        nowcast_key = (cutoff, "forecast", substance_code)
         forecast_key = (source_hour + timedelta(hours=2), "forecast", substance_code)
-        if analysis_key not in existing_keys or (
-            row["forecast_expected"] and forecast_key not in existing_keys
+        analysis_generated = existing_frames.get(analysis_key)
+        nowcast_generated = existing_frames.get(nowcast_key)
+        if (
+            analysis_key not in existing_frames
+            or (row["forecast_expected"] and forecast_key not in existing_frames)
+            or (
+                cutoff == due_cutoff
+                and (
+                    nowcast_key not in existing_frames
+                    or (
+                        analysis_generated is not None
+                        and nowcast_generated is not None
+                        and nowcast_generated < analysis_generated
+                    )
+                )
+            )
         ):
             missing.add(cutoff)
 
@@ -79,7 +95,7 @@ def missing_grid_cutoffs(due_cutoff: datetime) -> list[datetime]:
         existing = fetch_all(
             connection,
             """
-            SELECT hour_start, data_kind, substance_code
+            SELECT hour_start, data_kind, substance_code, max(generated_at) AS generated_at
             FROM public.gas_concentration_frames
             WHERE substance_code = ANY(%s)
               AND hour_start >= %s
@@ -93,7 +109,7 @@ def missing_grid_cutoffs(due_cutoff: datetime) -> list[datetime]:
             ),
         )
 
-    return _cutoffs_to_rebuild(expected, existing)
+    return _cutoffs_to_rebuild(expected, existing, due_cutoff)
 
 
 def run_due_forecasts(now: datetime | None = None) -> dict[str, object]:

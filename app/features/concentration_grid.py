@@ -658,6 +658,7 @@ def build_semiphysical_forecast_grid(
     substance_code: str,
     wind_speed: float | None,
     wind_from_degrees: float | None,
+    weather_anchors: pd.DataFrame | None = None,
     boundary_layer_height: float | None = None,
     precipitation: float | None = None,
     duration_seconds: float = SECONDS_PER_HOUR,
@@ -666,6 +667,7 @@ def build_semiphysical_forecast_grid(
     if analysis_grid.empty:
         return pd.DataFrame()
     anchors = _clean_anchors(forecast_anchors)
+    weather_sources = _clean_anchors(weather_anchors) if weather_anchors is not None else anchors
     settings = get_settings()
     step = float(settings.GRID_CELL_METERS)
     radius = float(settings.MAX_OBSERVATION_INFLUENCE_METERS)
@@ -677,6 +679,9 @@ def build_semiphysical_forecast_grid(
     if not anchors.empty:
         latitude_values.append(anchors["latitude"])
         longitude_values.append(anchors["longitude"])
+    if weather_anchors is not None and not weather_sources.empty:
+        latitude_values.append(weather_sources["latitude"])
+        longitude_values.append(weather_sources["longitude"])
     reference_latitude = float(pd.concat(latitude_values, ignore_index=True).mean())
     reference_longitude = float(pd.concat(longitude_values, ignore_index=True).mean())
     source_x, source_y = _project(
@@ -692,12 +697,8 @@ def build_semiphysical_forecast_grid(
     fallback_u_value = float(np.asarray(fallback_u))
     fallback_v_value = float(np.asarray(fallback_v))
     if anchors.empty:
-        weather_x = np.asarray([], dtype=float)
-        weather_y = np.asarray([], dtype=float)
-        weather_u = np.asarray([], dtype=float)
-        weather_v = np.asarray([], dtype=float)
-        weather_pbl = np.asarray([], dtype=float)
-        weather_rain = np.asarray([], dtype=float)
+        anchor_x = np.asarray([], dtype=float)
+        anchor_y = np.asarray([], dtype=float)
     else:
         anchor_x, anchor_y = _project(
             anchors["latitude"].to_numpy(float),
@@ -705,9 +706,22 @@ def build_semiphysical_forecast_grid(
             reference_latitude,
             reference_longitude,
         )
-        weather_x, weather_y = anchor_x, anchor_y
+    if weather_sources.empty:
+        weather_x = np.asarray([], dtype=float)
+        weather_y = np.asarray([], dtype=float)
+        weather_u = np.asarray([], dtype=float)
+        weather_v = np.asarray([], dtype=float)
+        weather_pbl = np.asarray([], dtype=float)
+        weather_rain = np.asarray([], dtype=float)
+    else:
+        weather_x, weather_y = _project(
+            weather_sources["latitude"].to_numpy(float),
+            weather_sources["longitude"].to_numpy(float),
+            reference_latitude,
+            reference_longitude,
+        )
         weather_u, weather_v, weather_pbl, weather_rain = _anchor_weather(
-            anchors,
+            weather_sources,
             wind_speed,
             wind_from_degrees,
             boundary_layer_height,
@@ -865,7 +879,7 @@ def build_semiphysical_forecast_grid(
     keep = (
         np.isfinite(values)
         & (confidence >= settings.GRID_MIN_CONFIDENCE)
-        & (station_coverage | (transported_coverage & significant))
+        & (station_coverage | (transported_coverage & (significant | anchors.empty)))
     )
     grid_x = grid_x[keep]
     grid_y = grid_y[keep]

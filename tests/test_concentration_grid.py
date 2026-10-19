@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
 
@@ -5,6 +7,8 @@ from app.features.concentration_grid import (
     assimilate_observations,
     build_semiphysical_forecast_grid,
 )
+from app.inference.concentration_grid import _attach_live_weather
+from app.inference import concentration_grid as stored_grids
 
 
 def _anchors() -> pd.DataFrame:
@@ -205,6 +209,104 @@ def test_forecast_uses_spatially_varying_wind_vectors():
 
     assert forecast["wind_u"].min() < 0.0
     assert forecast["wind_u"].max() > 0.0
+
+
+def test_nowcast_uses_local_weather_without_station_predictions():
+    anchors = _anchors().iloc[:2].copy()
+    analysis = assimilate_observations(anchors, None)
+    weather = anchors.copy()
+    weather["weather_wind_speed"] = [3.0, 3.0]
+    weather["weather_wind_direction"] = [270.0, 90.0]
+
+    nowcast = build_semiphysical_forecast_grid(
+        analysis,
+        pd.DataFrame(),
+        substance_code="NO2",
+        wind_speed=3.0,
+        wind_from_degrees=270.0,
+        weather_anchors=weather,
+    )
+
+    assert not nowcast.empty
+    assert nowcast["wind_u"].min() < 0.0
+    assert nowcast["wind_u"].max() > 0.0
+    assert (nowcast["correction_value"] == 0.0).all()
+    assert set(nowcast["source_station_count"]) == {2}
+
+
+def test_nowcast_uses_historical_weather_when_live_station_weather_is_missing():
+    sources = _anchors().iloc[:2].copy()
+    sources["weather_wind_speed"] = [2.0, 3.0]
+    live = pd.DataFrame([{
+        "monitoring_post_id": 1,
+        "wind_speed_100m": 5.0,
+        "wind_direction_100m": 270.0,
+        "boundary_layer_height": 600.0,
+        "precipitation": 0.0,
+    }])
+
+    weather_sources = _attach_live_weather(sources, live)
+
+    assert weather_sources["weather_wind_speed"].tolist() == [5.0, 3.0]
+
+
+def test_zero_concentration_nowcast_remains_available():
+    anchor = _anchors().iloc[:1].copy()
+    anchor["value"] = 0.0
+    analysis = assimilate_observations(anchor, None)
+
+    nowcast = build_semiphysical_forecast_grid(
+        analysis,
+        pd.DataFrame(),
+        substance_code="NO2",
+        wind_speed=0.0,
+        wind_from_degrees=0.0,
+        weather_anchors=anchor,
+    )
+
+    assert not nowcast.empty
+    assert (nowcast["value"] == 0.0).all()
+
+
+def test_missing_analysis_keeps_existing_current_hour_forecast(monkeypatch):
+    def reject_delete(*_args):
+        raise AssertionError("forecast was deleted")
+
+    monkeypatch.setattr(stored_grids, "_stored_grid", lambda *_: pd.DataFrame())
+    monkeypatch.setattr(stored_grids, "_replace_grid", reject_delete)
+
+    result = stored_grids.build_nowcast_grid(
+        None, "NO2", datetime(2026, 9, 25, 10, tzinfo=timezone.utc)
+    )
+
+    assert result == 0
+
+
+def test_next_hour_forecast_uses_nowcast_as_background():
+    anchors = _anchors().iloc[:2].copy()
+    analysis = assimilate_observations(anchors, None)
+    nowcast = build_semiphysical_forecast_grid(
+        analysis,
+        pd.DataFrame(),
+        substance_code="NO2",
+        wind_speed=2.0,
+        wind_from_degrees=270.0,
+        weather_anchors=anchors,
+    )
+    predictions = anchors.copy()
+    predictions["value"] = [0.06, 0.10]
+
+    forecast = build_semiphysical_forecast_grid(
+        nowcast,
+        predictions,
+        substance_code="NO2",
+        wind_speed=2.0,
+        wind_from_degrees=270.0,
+    )
+
+    assert not forecast.empty
+    assert set(forecast["source_station_count"]) == {2}
+    assert forecast["correction_value"].abs().max() > 0.0
 
 
 def test_semiphysical_forecast_stores_physical_and_statistical_components():
