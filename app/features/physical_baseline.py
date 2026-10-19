@@ -10,6 +10,7 @@ GAS_DECAY_PER_HOUR = {
     "NO2": 0.08,
     "O3": 0.04,
     "SO2": 0.07,
+    "H2S": 0.05,
 }
 
 GAS_RAIN_SCAVENGING = {
@@ -18,6 +19,7 @@ GAS_RAIN_SCAVENGING = {
     "NO2": 0.012,
     "O3": 0.004,
     "SO2": 0.025,
+    "H2S": 0.008,
 }
 
 

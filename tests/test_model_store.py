@@ -1,8 +1,22 @@
-from app.config import SERVICE_ROOT
-from app.training.model_store import resolve_artifact_path
+from app.models.base import ModelArtifact, deserialize_artifact, serialize_artifact
 
 
-def test_resolve_artifact_path_accepts_windows_separator_from_database():
-    resolved = resolve_artifact_path(r"artifacts\current\gas_forecast.joblib")
+class ConstantEstimator:
+    def predict(self, frame):
+        return [1.5] * len(frame)
 
-    assert resolved == SERVICE_ROOT / "artifacts" / "current" / "gas_forecast.joblib"
+
+def test_model_artifact_round_trip_through_bytes():
+    artifact = ModelArtifact(
+        estimator=ConstantEstimator(),
+        feature_columns=["temperature"],
+        categorical_features=[],
+        residual_lower=-0.1,
+        residual_upper=0.2,
+        metadata={"active_gases": ["NO2"]},
+    )
+
+    restored = deserialize_artifact(serialize_artifact(artifact))
+
+    assert restored.feature_columns == ["temperature"]
+    assert restored.metadata == {"active_gases": ["NO2"]}

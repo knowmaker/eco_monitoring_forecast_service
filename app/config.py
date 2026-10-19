@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
+FORECAST_GASES = ("CO", "NO", "NO2", "O3", "SO2", "H2S")
 
 
 class Settings(BaseSettings):
@@ -19,11 +20,8 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = Field(validation_alias=AliasChoices("DATABASE_URL", "DB_DSN"))
     APP_TIMEZONE: str = "Europe/Moscow"
-    FORECAST_RUN_MINUTE: int = Field(default=10, ge=0, le=59)
     FORECAST_CATCHUP_HOURS: int = Field(default=72, ge=1, le=168)
     FEATURE_LOOKBACK_HOURS: int = Field(default=72, ge=24)
-    ACTIVE_GASES: str = "CO,NO,NO2,O3,SO2"
-    ARTIFACTS_DIR: Path = SERVICE_ROOT / "artifacts"
     CATBOOST_ITERATIONS: int = Field(default=300, ge=20)
     CATBOOST_DEPTH: int = Field(default=6, ge=2, le=12)
     CATBOOST_LEARNING_RATE: float = Field(default=0.05, gt=0, le=1)
@@ -52,7 +50,7 @@ class Settings(BaseSettings):
 
     @property
     def active_gases(self) -> tuple[str, ...]:
-        return tuple(code.strip().upper() for code in self.ACTIVE_GASES.split(",") if code.strip())
+        return FORECAST_GASES
 
 
 @lru_cache(maxsize=1)

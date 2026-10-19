@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from io import BytesIO
 from typing import Any
 
 import joblib
@@ -37,18 +37,16 @@ class ModelArtifact:
         return np.asarray(self.estimator.predict(self.prepare(frame)), dtype=float)
 
 
-def save_artifact(path: Path, artifact: ModelArtifact) -> None:
-    """Replace the current artifact without exposing a partially written file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    joblib.dump(artifact, temporary_path)
-    temporary_path.replace(path)
+def serialize_artifact(artifact: ModelArtifact) -> bytes:
+    buffer = BytesIO()
+    joblib.dump(artifact, buffer)
+    return buffer.getvalue()
 
 
-def load_artifact(path: Path) -> ModelArtifact:
-    artifact = joblib.load(path)
+def deserialize_artifact(payload: bytes | memoryview) -> ModelArtifact:
+    artifact = joblib.load(BytesIO(bytes(payload)))
     if not isinstance(artifact, ModelArtifact):
-        raise TypeError(f"Unsupported artifact in {path}")
+        raise TypeError("Unsupported model artifact")
     return artifact
 
 

@@ -14,8 +14,8 @@ from app.inference.store import (
     remove_predictions_without_latest_measurement,
     set_prediction_status,
 )
-from app.models.base import load_artifact, prediction_results
-from app.training.model_store import get_current_model, resolve_artifact_path
+from app.models.base import deserialize_artifact, prediction_results
+from app.training.model_store import get_current_model
 
 
 def _eligible_prediction_rows(
@@ -57,7 +57,7 @@ def predict_all_stations(cutoff: datetime) -> dict[str, int]:
             mark_rows(connection, rows, "unavailable", "Обученная модель отсутствует.")
             return counts
         try:
-            artifact = load_artifact(resolve_artifact_path(model["artifact_path"]))
+            artifact = deserialize_artifact(model["artifact"])
             prepared = rows.copy()
             prepared["substance_code"] = prepared["substance_code"].astype(str)
             results = prediction_results(artifact, prepared)

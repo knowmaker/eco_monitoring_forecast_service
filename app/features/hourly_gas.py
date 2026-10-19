@@ -100,6 +100,42 @@ def _raw_gas_frame(
     return frame.dropna(subset=["value"])
 
 
+def _mosecom_hourly_frame(
+    connection: Connection,
+    substance_codes: Iterable[str],
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> pd.DataFrame:
+    conditions = ["value IS NOT NULL", "substance_code = ANY(%s)"]
+    params: list[object] = [list(substance_codes)]
+    if start is not None:
+        conditions.append("bucket_ms >= %s")
+        params.append(int(start.timestamp() * 1000))
+    if end is not None:
+        conditions.append("bucket_ms < %s")
+        params.append(int(end.timestamp() * 1000))
+
+    rows = fetch_all(
+        connection,
+        f"""
+        SELECT monitoring_post_id,
+               upper(substance_code) AS substance_code,
+               bucket_ms,
+               value
+        FROM public.mosecom_hourly_readings
+        WHERE {' AND '.join(conditions)}
+        ORDER BY monitoring_post_id, upper(substance_code), bucket_ms
+        """,
+        params,
+    )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame["bucket_start"] = pd.to_datetime(frame["bucket_ms"], unit="ms", utc=True)
+    frame["value"] = pd.to_numeric(frame["value"], errors="coerce").abs()
+    return frame.dropna(subset=["value"])
+
+
 def _causal_median_by_continuous_segment(group: pd.DataFrame) -> pd.Series:
     ordered = group.sort_values("timestamp")
     deltas = ordered["timestamp"].diff().dt.total_seconds()
@@ -142,6 +178,22 @@ def build_hourly_features(raw: pd.DataFrame, timezone_name: str) -> pd.DataFrame
     return hourly
 
 
+def build_mosecom_hourly_features(readings: pd.DataFrame) -> pd.DataFrame:
+    if readings.empty:
+        return pd.DataFrame()
+
+    hourly = readings[["monitoring_post_id", "substance_code", "bucket_start", "value"]].copy()
+    hourly["raw_hourly_mean"] = hourly["value"]
+    hourly["raw_hourly_median"] = hourly["value"]
+    hourly["filtered_hourly_mean"] = hourly["value"]
+    hourly["hourly_min"] = hourly["value"]
+    hourly["hourly_max"] = hourly["value"]
+    hourly["hourly_p95"] = hourly["value"]
+    hourly["hourly_std"] = 0.0
+    hourly["samples_count"] = 1
+    return hourly.drop(columns="value")
+
+
 def _database_rows(hourly: pd.DataFrame) -> Iterable[tuple[object, ...]]:
     for row in hourly.itertuples(index=False):
         yield (
@@ -171,7 +223,15 @@ def refresh_hourly_gas_features(
     # Include two extra raw samples before the requested window for causal median continuity.
     query_start = start - timedelta(hours=1) if start is not None else None
     raw = _raw_gas_frame(connection, query_start, end)
-    hourly = build_hourly_features(raw, settings.APP_TIMEZONE)
+    internal_hourly = build_hourly_features(raw, settings.APP_TIMEZONE)
+    mosecom_readings = _mosecom_hourly_frame(
+        connection,
+        settings.active_gases,
+        start,
+        end,
+    )
+    mosecom_hourly = build_mosecom_hourly_features(mosecom_readings)
+    hourly = pd.concat((internal_hourly, mosecom_hourly), ignore_index=True)
     if start is not None and not hourly.empty:
         hourly = hourly[hourly["bucket_start"] >= pd.Timestamp(start)]
     if hourly.empty:

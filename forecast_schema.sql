@@ -49,7 +49,7 @@ CREATE INDEX idx_external_weather_kind_bucket
 -- Exactly one current artifact for all gases and stations.
 CREATE TABLE public.current_model (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-    artifact_path TEXT NOT NULL,
+    artifact BYTEA NOT NULL,
     feature_columns JSONB NOT NULL,
     categorical_features JSONB NOT NULL DEFAULT '[]'::jsonb,
     train_start TIMESTAMPTZ NOT NULL,

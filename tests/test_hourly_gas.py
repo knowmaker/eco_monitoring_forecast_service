@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from app.features.hourly_gas import build_hourly_features
+from app.features.hourly_gas import build_hourly_features, build_mosecom_hourly_features
 
 
 def test_causal_median_is_applied_before_hourly_mean():
@@ -63,3 +63,21 @@ def test_hourly_features_use_absolute_gas_values():
     assert hourly.raw_hourly_mean == pytest.approx(2.0)
     assert hourly.hourly_min == pytest.approx(1.0)
     assert hourly.hourly_max == pytest.approx(3.0)
+
+
+def test_mosecom_hourly_values_are_not_filtered_again():
+    readings = pd.DataFrame(
+        {
+            "monitoring_post_id": [10, 10, 10],
+            "substance_code": ["H2S", "H2S", "H2S"],
+            "bucket_start": pd.to_datetime(
+                ["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", "2026-01-01T02:00:00Z"]
+            ),
+            "value": [0.001, 0.1, 0.002],
+        }
+    )
+
+    hourly = build_mosecom_hourly_features(readings)
+
+    assert hourly["filtered_hourly_mean"].tolist() == [0.001, 0.1, 0.002]
+    assert hourly["samples_count"].tolist() == [1, 1, 1]

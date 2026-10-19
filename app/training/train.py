@@ -8,7 +8,7 @@ from app.db import db_connection
 from app.features.local_features import build_local_frame, feature_columns
 from app.features.physical_baseline import add_physical_baseline
 from app.features.spatial_features import add_spatial_features
-from app.models.base import ModelArtifact, save_artifact
+from app.models.base import ModelArtifact, serialize_artifact
 from app.models.spatial import create_estimator
 from app.training.backtest import chronological_split, regression_metrics, residual_interval
 from app.training.model_store import replace_current_model
@@ -83,7 +83,6 @@ def train_and_replace() -> dict[str, object]:
 
         final_estimator = create_estimator(categorical)
         final_estimator.fit(clean[columns], clean["correction_target"])
-        artifact_path = settings.ARTIFACTS_DIR / "current" / "gas_forecast.joblib"
         artifact = ModelArtifact(
             estimator=final_estimator,
             feature_columns=columns,
@@ -94,12 +93,12 @@ def train_and_replace() -> dict[str, object]:
                 "metrics": metrics,
                 "residual_intervals": residual_intervals,
                 "prediction_mode": "physical_residual",
+                "active_gases": list(settings.active_gases),
             },
         )
-        save_artifact(artifact_path, artifact)
         replace_current_model(
             connection,
-            artifact_path=artifact_path,
+            artifact=serialize_artifact(artifact),
             feature_columns=columns,
             categorical_features=categorical,
             train_start=clean["target_start"].min().to_pydatetime(),
