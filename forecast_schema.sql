@@ -83,7 +83,7 @@ CREATE TABLE public.gas_concentration_frames (
     id BIGSERIAL PRIMARY KEY,
     substance_code TEXT NOT NULL,
     hour_start TIMESTAMPTZ NOT NULL,
-    data_kind TEXT NOT NULL CHECK (data_kind IN ('observed', 'forecast')),
+    data_kind TEXT NOT NULL CHECK (data_kind IN ('analysis', 'forecast')),
     payload BYTEA NOT NULL,
     content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
     cell_count INTEGER NOT NULL CHECK (cell_count > 0),

@@ -34,9 +34,9 @@ def _cutoffs_to_rebuild(
             continue
         cutoff = source_hour + timedelta(hours=1)
         eligible_cutoffs.add(cutoff)
-        observed_key = (source_hour, "observed", substance_code)
+        analysis_key = (source_hour, "analysis", substance_code)
         forecast_key = (source_hour + timedelta(hours=2), "forecast", substance_code)
-        if observed_key not in existing_keys or (
+        if analysis_key not in existing_keys or (
             row["forecast_expected"] and forecast_key not in existing_keys
         ):
             missing.add(cutoff)

@@ -34,7 +34,7 @@ def _anchor_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return frame
 
 
-def _observed_anchors(connection: Connection, substance_code: str, hour_start: datetime) -> pd.DataFrame:
+def _analysis_anchors(connection: Connection, substance_code: str, hour_start: datetime) -> pd.DataFrame:
     return _anchor_frame(
         fetch_all(
             connection,
@@ -351,8 +351,8 @@ def _mean_weather_frame(
     }
 
 
-def build_observed_grid(connection: Connection, substance_code: str, hour_start: datetime) -> int:
-    anchors = _observed_anchors(connection, substance_code, hour_start)
+def build_analysis_grid(connection: Connection, substance_code: str, hour_start: datetime) -> int:
+    anchors = _analysis_anchors(connection, substance_code, hour_start)
     station_ids = anchors["monitoring_post_id"].astype(int).tolist() if not anchors.empty else []
     wind_speed, wind_direction = _mean_wind(
         connection,
@@ -367,7 +367,7 @@ def build_observed_grid(connection: Connection, substance_code: str, hour_start:
         wind_speed=wind_speed,
         wind_from_degrees=wind_direction,
     )
-    return _replace_grid(connection, substance_code, hour_start, "observed", grid)
+    return _replace_grid(connection, substance_code, hour_start, "analysis", grid)
 
 
 def build_forecast_grid(connection: Connection, substance_code: str, hour_start: datetime) -> int:
@@ -391,7 +391,7 @@ def build_forecast_grid(connection: Connection, substance_code: str, hour_start:
     )
     source_hour = data_cutoff - timedelta(hours=1) if data_cutoff is not None else None
     analysis = (
-        _stored_grid(connection, substance_code, source_hour, "observed")
+        _stored_grid(connection, substance_code, source_hour, "analysis")
         if source_hour is not None
         else pd.DataFrame()
     )
@@ -409,12 +409,12 @@ def build_forecast_grid(connection: Connection, substance_code: str, hour_start:
 
 
 def refresh_concentration_grids(cutoff: datetime) -> dict[str, int]:
-    observed_hour = cutoff - timedelta(hours=1)
+    analysis_hour = cutoff - timedelta(hours=1)
     forecast_hour = cutoff + timedelta(hours=1)
-    counts = {"observed": 0, "forecast": 0}
+    counts = {"analysis": 0, "forecast": 0}
     with db_connection() as connection:
         for substance_code in get_settings().active_gases:
-            counts["observed"] += build_observed_grid(connection, substance_code, observed_hour)
+            counts["analysis"] += build_analysis_grid(connection, substance_code, analysis_hour)
             counts["forecast"] += build_forecast_grid(connection, substance_code, forecast_hour)
         retention_start = cutoff - timedelta(hours=get_settings().GRID_RETENTION_HOURS)
         with connection.cursor() as cursor:
@@ -427,7 +427,7 @@ def refresh_concentration_grids(cutoff: datetime) -> dict[str, int]:
 
 
 def backfill_concentration_grids() -> dict[str, int]:
-    counts = {"observed": 0, "forecast": 0}
+    counts = {"analysis": 0, "forecast": 0}
     settings = get_settings()
     retention_start = datetime.now(timezone.utc).replace(
         minute=0,
@@ -436,7 +436,7 @@ def backfill_concentration_grids() -> dict[str, int]:
     ) - timedelta(hours=settings.GRID_RETENTION_HOURS)
     source_start = retention_start - timedelta(hours=2)
     with db_connection() as connection:
-        observed_rows = fetch_all(
+        analysis_source_rows = fetch_all(
             connection,
             """
             SELECT h.substance_code, h.bucket_start AS hour_start,
@@ -493,7 +493,7 @@ def backfill_concentration_grids() -> dict[str, int]:
             WHERE data_kind IN ('historical_forecast', 'live_forecast')
             """,
         )
-        observed = pd.DataFrame(observed_rows)
+        analysis_sources = pd.DataFrame(analysis_source_rows)
         forecast = pd.DataFrame(forecast_rows)
         weather = pd.DataFrame(weather_rows)
         weather_by_hour = (
@@ -507,13 +507,13 @@ def backfill_concentration_grids() -> dict[str, int]:
             if not weather.empty
             else {}
         )
-        observed_by_hour = {
+        analysis_sources_by_hour = {
             (substance_code, hour_start): group
-            for (substance_code, hour_start), group in observed.groupby(
+            for (substance_code, hour_start), group in analysis_sources.groupby(
                 ["substance_code", "hour_start"],
                 sort=False,
             )
-        } if not observed.empty else {}
+        } if not analysis_sources.empty else {}
         if not forecast.empty:
             forecast["source_hour"] = forecast["data_cutoff"] - pd.Timedelta(hours=1)
         forecast_by_source = {
@@ -525,8 +525,11 @@ def backfill_concentration_grids() -> dict[str, int]:
         } if not forecast.empty else {}
 
         forecast_grids: dict[tuple[str, datetime], pd.DataFrame] = {}
-        for substance_code, hour_start in sorted(observed_by_hour, key=lambda item: (item[1], item[0])):
-            anchors = observed_by_hour[(substance_code, hour_start)]
+        for substance_code, hour_start in sorted(
+            analysis_sources_by_hour,
+            key=lambda item: (item[1], item[0]),
+        ):
+            anchors = analysis_sources_by_hour[(substance_code, hour_start)]
             station_ids = anchors["monitoring_post_id"].astype(int).tolist()
             wind_speed, wind_direction = _mean_wind_frame(
                 weather_by_hour,
@@ -541,11 +544,11 @@ def backfill_concentration_grids() -> dict[str, int]:
                 wind_from_degrees=wind_direction,
             )
             if not analysis_grid.empty and hour_start >= retention_start:
-                counts["observed"] += _replace_grid(
+                counts["analysis"] += _replace_grid(
                     connection,
                     substance_code,
                     hour_start,
-                    "observed",
+                    "analysis",
                     analysis_grid,
                 )
             forecast_anchors = forecast_by_source.get((substance_code, hour_start))
