@@ -919,7 +919,10 @@ def build_semiphysical_forecast_grid(
     physical = physical.ravel()
     transported_confidence = transported_confidence.ravel()
 
-    if anchors.empty:
+    source_anchors = anchors if not anchors.empty else weather_sources
+    correction_x = anchor_x if not anchors.empty else weather_x
+    correction_y = anchor_y if not anchors.empty else weather_y
+    if source_anchors.empty:
         values = physical.copy()
         confidence = transported_confidence.copy()
         correction = np.zeros_like(values)
@@ -927,28 +930,35 @@ def build_semiphysical_forecast_grid(
         upper_bounds = np.full_like(values, np.nan)
         station_coverage = np.zeros(len(values), dtype=bool)
     else:
-        anchor_confidence = _observation_confidence(anchors)
+        anchor_confidence = _observation_confidence(source_anchors)
+        if anchors.empty:
+            anchor_confidence *= settings.PHYSICS_CONFIDENCE_RETENTION_PER_HOUR ** (
+                duration_seconds / SECONDS_PER_HOUR
+            )
+        source_u, source_v, _, _ = _anchor_weather(
+            source_anchors, wind_speed, wind_from_degrees
+        )
         values, confidence, correction = _optimal_interpolation(
             grid_x,
             grid_y,
             physical,
             transported_confidence,
-            anchor_x,
-            anchor_y,
-            anchors["value"].to_numpy(float),
+            correction_x,
+            correction_y,
+            source_anchors["value"].to_numpy(float),
             anchor_confidence,
-            weather_u,
-            weather_v,
+            source_u,
+            source_v,
             step,
         )
-        lower_values = anchors["lower_bound"].to_numpy(float)
-        upper_values = anchors["upper_bound"].to_numpy(float)
+        lower_values = _numeric(anchors, "lower_bound")
+        upper_values = _numeric(anchors, "upper_bound")
         if np.isfinite(lower_values).any():
             usable = np.isfinite(lower_values)
             lower_bounds = _optimal_interpolation(
                 grid_x, grid_y, physical, transported_confidence,
-                anchor_x[usable], anchor_y[usable], lower_values[usable],
-                anchor_confidence[usable], weather_u[usable], weather_v[usable], step,
+                correction_x[usable], correction_y[usable], lower_values[usable],
+                anchor_confidence[usable], source_u[usable], source_v[usable], step,
             )[0]
         else:
             lower_bounds = np.full_like(values, np.nan)
@@ -956,12 +966,12 @@ def build_semiphysical_forecast_grid(
             usable = np.isfinite(upper_values)
             upper_bounds = _optimal_interpolation(
                 grid_x, grid_y, physical, transported_confidence,
-                anchor_x[usable], anchor_y[usable], upper_values[usable],
-                anchor_confidence[usable], weather_u[usable], weather_v[usable], step,
+                correction_x[usable], correction_y[usable], upper_values[usable],
+                anchor_confidence[usable], source_u[usable], source_v[usable], step,
             )[0]
         else:
             upper_bounds = np.full_like(values, np.nan)
-        station_distance = cKDTree(np.column_stack((anchor_x, anchor_y))).query(
+        station_distance = cKDTree(np.column_stack((correction_x, correction_y))).query(
             np.column_stack((grid_x, grid_y)),
             k=1,
         )[0]

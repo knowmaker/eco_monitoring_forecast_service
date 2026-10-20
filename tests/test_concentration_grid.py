@@ -293,8 +293,33 @@ def test_nowcast_uses_local_weather_without_station_predictions():
     assert not nowcast.empty
     assert nowcast["wind_u"].min() < 0.0
     assert nowcast["wind_u"].max() > 0.0
-    assert (nowcast["correction_value"] == 0.0).all()
+    assert nowcast["correction_value"].abs().max() > 0.0
+    assert nowcast["lower_bound"].isna().all()
+    assert nowcast["upper_bound"].isna().all()
     assert set(nowcast["source_station_count"]) == {2}
+
+
+def test_nowcast_retains_latest_station_value_after_wind_transport():
+    anchor = _anchors().iloc[:1].copy()
+    analysis = assimilate_observations(anchor, None)
+    nowcast = build_semiphysical_forecast_grid(
+        analysis,
+        pd.DataFrame(),
+        substance_code="NO2",
+        wind_speed=4.0,
+        wind_from_degrees=270.0,
+        weather_anchors=anchor,
+    )
+
+    distance = np.hypot(
+        (nowcast["latitude"] - anchor.iloc[0]["latitude"]) * 111_320,
+        (nowcast["longitude"] - anchor.iloc[0]["longitude"])
+        * 111_320 * np.cos(np.deg2rad(anchor.iloc[0]["latitude"])),
+    )
+    nearest = nowcast.loc[distance.idxmin()]
+    assert distance.min() < 500
+    assert nearest["value"] > 0.01
+    assert nearest["confidence"] > 0.1
 
 
 def test_nowcast_uses_historical_weather_when_live_station_weather_is_missing():

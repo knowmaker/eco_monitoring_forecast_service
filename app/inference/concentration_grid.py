@@ -108,6 +108,7 @@ def _nowcast_weather_anchors(
             """
             SELECT h.monitoring_post_id, p.latitude, p.longitude,
                    GREATEST(h.filtered_hourly_mean, 0.0) AS value,
+                   h.samples_count, p.source,
                    COALESCE(w.wind_speed_100m, old_w.wind_speed_100m) AS weather_wind_speed,
                    COALESCE(w.wind_direction_100m, old_w.wind_direction_100m) AS weather_wind_direction,
                    COALESCE(w.boundary_layer_height, old_w.boundary_layer_height) AS weather_boundary_layer_height,
