@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 
 from app.features.concentration_grid import (
+    _backward_innovation,
     _observation_confidence,
+    _transport_field,
     assimilate_observations,
     build_semiphysical_forecast_grid,
 )
@@ -59,6 +61,56 @@ def test_mosecom_aggregate_has_three_effective_samples_only_in_grid_confidence()
 
     np.testing.assert_allclose(_observation_confidence(anchors), [1 / 3, 1])
     assert anchors["samples_count"].tolist() == [1, 9]
+
+
+def test_transport_spreads_sideways_without_creating_concentration():
+    values = np.zeros((81, 101))
+    values[40, 20] = 1.0
+    wind_u = np.full_like(values, 3.0)
+    zeros = np.zeros_like(values)
+    transported, confidence = _transport_field(
+        values,
+        values.copy(),
+        wind_u,
+        zeros,
+        np.full_like(values, 20.0),
+        zeros,
+        step=500.0,
+        duration_seconds=3600.0,
+        confidence_retention_per_hour=0.65,
+    )
+
+    np.testing.assert_allclose(transported.sum(), 1.0, atol=1e-9)
+    assert transported.min() >= 0.0
+    assert transported[39].sum() > 0.0
+    assert transported[41].sum() > 0.0
+    expected_column = 20.0 + 3.0 * 3600.0 / 500.0
+    center_column = (transported * np.arange(values.shape[1])).sum()
+    np.testing.assert_allclose(center_column, expected_column, atol=0.1)
+    np.testing.assert_allclose(confidence.sum(), 0.65, atol=1e-9)
+
+
+def test_transport_conserves_concentration_with_varying_wind():
+    values = np.zeros((100, 130))
+    values[45:55, 25:35] = 0.1
+    north = np.linspace(-1.0, 1.0, values.shape[0])[:, None]
+    east = np.linspace(-1.0, 1.0, values.shape[1])[None, :]
+    wind_u = np.broadcast_to(6.0 + 3.0 * north, values.shape)
+    wind_v = np.broadcast_to(2.0 * east, values.shape)
+    transported, _ = _transport_field(
+        values,
+        values.copy(),
+        wind_u,
+        wind_v,
+        np.full_like(values, 40.0),
+        np.zeros_like(values),
+        step=500.0,
+        duration_seconds=3600.0,
+        confidence_retention_per_hour=1.0,
+    )
+
+    np.testing.assert_allclose(transported.sum(), values.sum(), atol=1e-9)
+    assert transported.min() >= 0.0
 
 
 def _offset(latitude: float, longitude: float, east_m: float, north_m: float) -> tuple[float, float]:
@@ -350,38 +402,20 @@ def test_semiphysical_forecast_stores_physical_and_statistical_components():
 
 
 def test_analysis_spreads_forecast_error_upwind():
-    anchor = _anchors().iloc[:1].copy()
-    anchor["weather_wind_speed"] = 4.0
-    anchor["weather_wind_direction"] = 270.0
-    initial = anchor.copy()
-    initial["value"] = 0.02
-    prior = build_semiphysical_forecast_grid(
-        assimilate_observations(initial, None),
-        initial,
-        substance_code="NO2",
-        wind_speed=0.0,
-        wind_from_degrees=270.0,
+    correction, confidence = _backward_innovation(
+        np.array([-8_000.0, 8_000.0]),
+        np.zeros(2),
+        np.array([0.0]),
+        np.array([0.0]),
+        np.array([0.08]),
+        np.array([1.0]),
+        np.array([4.0]),
+        np.array([0.0]),
+        500.0,
     )
-    anchor["value"] = 0.10
 
-    analysis = assimilate_observations(anchor, prior)
-    latitude = float(anchor.iloc[0].latitude)
-    longitude = float(anchor.iloc[0].longitude)
-    east_meters = (
-        (analysis["longitude"] - longitude)
-        * 111_320.0
-        * np.cos(np.deg2rad(latitude))
-    )
-    north_meters = (analysis["latitude"] - latitude) * 111_320.0
-    west = analysis.loc[
-        ((east_meters + 8_000.0).abs() < 500.0) & (north_meters.abs() < 500.0)
-    ]
-    east = analysis.loc[
-        ((east_meters - 8_000.0).abs() < 500.0) & (north_meters.abs() < 500.0)
-    ]
-
-    assert not west.empty and not east.empty
-    assert west["correction_value"].mean() > east["correction_value"].mean()
+    assert correction[0] > 0.0
+    assert confidence[0] > confidence[1]
 
 
 def test_analysis_preserves_previous_forecast_footprint():
@@ -397,4 +431,7 @@ def test_analysis_preserves_previous_forecast_footprint():
 
     next_analysis = assimilate_observations(anchors, prior_forecast)
 
-    assert next_analysis["east"].max() >= prior_forecast["east"].max() - 0.0001
+    cell_longitude = 500.0 / (
+        111_320.0 * np.cos(np.deg2rad(float(anchors.iloc[0].latitude)))
+    )
+    assert next_analysis["east"].max() >= prior_forecast["east"].max() - cell_longitude

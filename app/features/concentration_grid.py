@@ -4,7 +4,6 @@ from math import cos, pi
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 
 from app.config import get_settings
@@ -617,7 +616,7 @@ def assimilate_observations(
     })
 
 
-def _deposit_average(
+def _deposit_sum(
     x: np.ndarray,
     y: np.ndarray,
     values: np.ndarray,
@@ -626,8 +625,7 @@ def _deposit_average(
     step: float,
     shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
-    numerator = np.zeros(shape, dtype=float)
-    denominator = np.zeros(shape, dtype=float)
+    deposited = np.zeros(shape, dtype=float)
     fx = (x - x_min) / step
     fy = (y - y_min) / step
     x0 = np.floor(fx).astype(int)
@@ -647,15 +645,100 @@ def _deposit_average(
             & (yi < shape[0])
             & np.isfinite(values)
         )
-        np.add.at(numerator, (yi[valid], xi[valid]), values[valid] * factor[valid])
-        np.add.at(denominator, (yi[valid], xi[valid]), factor[valid])
-    averaged = np.divide(
-        numerator,
-        denominator,
-        out=np.zeros_like(numerator),
-        where=denominator > 0.0,
+        np.add.at(deposited, (yi[valid], xi[valid]), values[valid] * factor[valid])
+    return deposited
+
+
+def _limited_slope(values: np.ndarray, axis: int) -> np.ndarray:
+    slope = np.zeros_like(values)
+    if axis == 1:
+        backward = values[:, 1:-1] - values[:, :-2]
+        forward = values[:, 2:] - values[:, 1:-1]
+        middle = slope[:, 1:-1]
+    else:
+        backward = values[1:-1, :] - values[:-2, :]
+        forward = values[2:, :] - values[1:-1, :]
+        middle = slope[1:-1, :]
+    middle[:] = np.where(
+        backward * forward > 0.0,
+        np.sign(backward) * np.minimum(np.abs(backward), np.abs(forward)),
+        0.0,
     )
-    return averaged, denominator
+    return slope
+
+
+def _transport_step(
+    values: np.ndarray,
+    wind_u: np.ndarray,
+    wind_v: np.ndarray,
+    diffusivity: np.ndarray,
+    step: float,
+    time_step: float,
+    *,
+    limited: bool,
+) -> np.ndarray:
+    if limited:
+        slope_x = _limited_slope(values, 1)
+        slope_y = _limited_slope(values, 0)
+        left_x = values[:, :-1] + 0.5 * slope_x[:, :-1]
+        right_x = values[:, 1:] - 0.5 * slope_x[:, 1:]
+        left_y = values[:-1, :] + 0.5 * slope_y[:-1, :]
+        right_y = values[1:, :] - 0.5 * slope_y[1:, :]
+    else:
+        left_x, right_x = values[:, :-1], values[:, 1:]
+        left_y, right_y = values[:-1, :], values[1:, :]
+    face_u = (wind_u[:, :-1] + wind_u[:, 1:]) / 2.0
+    face_v = (wind_v[:-1, :] + wind_v[1:, :]) / 2.0
+    flux_x = np.zeros((values.shape[0], values.shape[1] + 1), dtype=float)
+    flux_y = np.zeros((values.shape[0] + 1, values.shape[1]), dtype=float)
+
+    flux_x[:, 1:-1] = (
+        face_u * np.where(face_u >= 0.0, left_x, right_x)
+        - (diffusivity[:, :-1] + diffusivity[:, 1:]) / 2.0
+        * (values[:, 1:] - values[:, :-1]) / step
+    )
+    flux_y[1:-1, :] = (
+        face_v * np.where(face_v >= 0.0, left_y, right_y)
+        - (diffusivity[:-1, :] + diffusivity[1:, :]) / 2.0
+        * (values[1:, :] - values[:-1, :]) / step
+    )
+    flux_x[:, 0] = np.minimum(wind_u[:, 0], 0.0) * values[:, 0]
+    flux_x[:, -1] = np.maximum(wind_u[:, -1], 0.0) * values[:, -1]
+    flux_y[0, :] = np.minimum(wind_v[0, :], 0.0) * values[0, :]
+    flux_y[-1, :] = np.maximum(wind_v[-1, :], 0.0) * values[-1, :]
+    return values - time_step / step * (
+        flux_x[:, 1:] - flux_x[:, :-1] + flux_y[1:, :] - flux_y[:-1, :]
+    )
+
+
+def _transport_field(
+    values: np.ndarray,
+    confidence: np.ndarray,
+    wind_u: np.ndarray,
+    wind_v: np.ndarray,
+    diffusivity: np.ndarray,
+    decay_per_hour: np.ndarray,
+    *,
+    step: float,
+    duration_seconds: float,
+    confidence_retention_per_hour: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    transport_rate = np.max(
+        (np.abs(wind_u) + np.abs(wind_v)) / step
+        + 4.0 * diffusivity / step**2
+    )
+    substeps = max(1, int(np.ceil(duration_seconds * transport_rate / 0.5)))
+    time_step = duration_seconds / substeps
+    decay_factor = np.exp(-decay_per_hour * time_step / SECONDS_PER_HOUR)
+    confidence_factor = confidence_retention_per_hour ** (time_step / SECONDS_PER_HOUR)
+    for _ in range(substeps):
+        values = _transport_step(
+            values, wind_u, wind_v, diffusivity, step, time_step, limited=True
+        ) * decay_factor
+        confidence = _transport_step(
+            confidence, wind_u, wind_v, diffusivity, step, time_step, limited=False
+        ) * confidence_factor
+    return np.maximum(values, 0.0), np.clip(confidence, 0.0, 1.0)
 
 
 def build_semiphysical_forecast_grid(
@@ -679,7 +762,6 @@ def build_semiphysical_forecast_grid(
     step = float(settings.GRID_CELL_METERS)
     radius = float(settings.MAX_OBSERVATION_INFLUENCE_METERS)
     duration_seconds = max(float(duration_seconds), 1.0)
-    duration_hours = duration_seconds / SECONDS_PER_HOUR
 
     latitude_values = [analysis_grid["latitude"]]
     longitude_values = [analysis_grid["longitude"]]
@@ -763,9 +845,12 @@ def build_semiphysical_forecast_grid(
         transported_x += local_u * time_step
         transported_y += local_v * time_step
 
-    support_x = np.concatenate((transported_x, anchor_x)) if len(anchor_x) else transported_x
-    support_y = np.concatenate((transported_y, anchor_y)) if len(anchor_y) else transported_y
-    padding = radius if len(anchor_x) else step
+    support_x = np.concatenate((source_x, transported_x, anchor_x))
+    support_y = np.concatenate((source_y, transported_y, anchor_y))
+    diffusion_padding = 3.0 * np.sqrt(
+        2.0 * settings.PHYSICS_MAX_DIFFUSIVITY_M2_S * duration_seconds
+    )
+    padding = max(radius if len(anchor_x) else 0.0, diffusion_padding, 2.0 * step)
     x_values, y_values, grid_x, grid_y, x_min, y_min = _grid_extent(
         support_x,
         support_y,
@@ -773,18 +858,18 @@ def build_semiphysical_forecast_grid(
         padding,
     )
     shape = (len(y_values), len(x_values))
-    physical, _ = _deposit_average(
-        transported_x,
-        transported_y,
+    physical = _deposit_sum(
+        source_x,
+        source_y,
         _numeric(analysis_grid, "value", 0.0),
         x_min,
         y_min,
         step,
         shape,
     )
-    transported_confidence, _ = _deposit_average(
-        transported_x,
-        transported_y,
+    transported_confidence = _deposit_sum(
+        source_x,
+        source_y,
         _numeric(analysis_grid, "confidence", 0.0),
         x_min,
         y_min,
@@ -816,22 +901,23 @@ def build_semiphysical_forecast_grid(
         settings.PHYSICS_MIN_DIFFUSIVITY_M2_S,
         settings.PHYSICS_MAX_DIFFUSIVITY_M2_S,
     )
-    sigma_cells = max(
-        np.sqrt(2.0 * float(np.mean(diffusivity)) * duration_seconds) / step,
-        0.35,
-    )
-    physical = gaussian_filter(physical, sigma=sigma_cells, mode="constant").ravel()
-    transported_confidence = np.clip(
-        gaussian_filter(transported_confidence, sigma=sigma_cells, mode="constant").ravel()
-        * settings.PHYSICS_CONFIDENCE_RETENTION_PER_HOUR**duration_hours,
-        0.0,
-        1.0,
-    )
     decay = (
         GAS_DECAY_PER_HOUR.get(substance_code, 0.05)
         + GAS_RAIN_SCAVENGING.get(substance_code, 0.008) * grid_rain
     )
-    physical *= np.exp(-decay * duration_hours)
+    physical, transported_confidence = _transport_field(
+        physical,
+        transported_confidence,
+        grid_u.reshape(shape),
+        grid_v.reshape(shape),
+        diffusivity.reshape(shape),
+        decay.reshape(shape),
+        step=step,
+        duration_seconds=duration_seconds,
+        confidence_retention_per_hour=settings.PHYSICS_CONFIDENCE_RETENTION_PER_HOUR,
+    )
+    physical = physical.ravel()
+    transported_confidence = transported_confidence.ravel()
 
     if anchors.empty:
         values = physical.copy()

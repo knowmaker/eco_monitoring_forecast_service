@@ -520,9 +520,10 @@ def refresh_concentration_grids(cutoff: datetime) -> dict[str, int]:
     return counts
 
 
-def backfill_concentration_grids() -> dict[str, int]:
+def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None) -> dict[str, int]:
     counts = {"analysis": 0, "forecast": 0}
     settings = get_settings()
+    substance_codes = substance_codes or settings.active_gases
     retention_start = datetime.now(timezone.utc).replace(
         minute=0,
         second=0,
@@ -555,7 +556,7 @@ def backfill_concentration_grids() -> dict[str, int]:
               AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
             ORDER BY h.bucket_start, h.substance_code, h.monitoring_post_id
             """,
-            (list(settings.active_gases), source_start),
+            (list(substance_codes), source_start),
         )
         forecast_rows = fetch_all(
             connection,
@@ -576,7 +577,7 @@ def backfill_concentration_grids() -> dict[str, int]:
               AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
             ORDER BY f.target_start, f.substance_code, f.monitoring_post_id
             """,
-            (list(settings.active_gases), retention_start),
+            (list(substance_codes), retention_start),
         )
         weather_rows = fetch_all(
             connection,
@@ -585,7 +586,9 @@ def backfill_concentration_grids() -> dict[str, int]:
                    wind_speed_100m, wind_direction_100m, boundary_layer_height, precipitation
             FROM public.external_weather_hourly
             WHERE data_kind IN ('historical_forecast', 'live_forecast')
+              AND bucket_start >= %s
             """,
+            (source_start,),
         )
         analysis_sources = pd.DataFrame(analysis_source_rows)
         forecast = pd.DataFrame(forecast_rows)
@@ -633,7 +636,7 @@ def backfill_concentration_grids() -> dict[str, int]:
             )
             analysis_grid = assimilate_observations(
                 anchors,
-                forecast_grids.get((substance_code, hour_start)),
+                forecast_grids.pop((substance_code, hour_start), None),
                 wind_speed=wind_speed,
                 wind_from_degrees=wind_direction,
             )
@@ -712,10 +715,11 @@ def backfill_concentration_grids() -> dict[str, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build and store gas concentration frames.")
     parser.add_argument("--backfill", action="store_true")
+    parser.add_argument("--gas", choices=get_settings().active_gases)
     parser.add_argument("--cutoff", help="Optional ISO-8601 data cutoff.")
     args = parser.parse_args()
     if args.backfill:
-        print(backfill_concentration_grids())
+        print(backfill_concentration_grids((args.gas,) if args.gas else None))
         return
     cutoff = datetime.fromisoformat(args.cutoff) if args.cutoff else datetime.now(timezone.utc)
     if cutoff.tzinfo is None:
