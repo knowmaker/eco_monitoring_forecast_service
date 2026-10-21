@@ -16,6 +16,7 @@ from app.features.concentration_grid import (
     assimilate_observations,
     build_semiphysical_forecast_grid,
 )
+from app.features.weather_features import ensure_historical_weather
 
 
 def _anchor_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -507,6 +508,7 @@ def refresh_concentration_grids(cutoff: datetime) -> dict[str, int]:
     forecast_hour = cutoff + timedelta(hours=1)
     counts = {"analysis": 0, "forecast": 0}
     with db_connection() as connection:
+        ensure_historical_weather(connection, analysis_hour)
         for substance_code in get_settings().active_gases:
             counts["analysis"] += build_analysis_grid(connection, substance_code, analysis_hour)
             counts["forecast"] += build_nowcast_grid(connection, substance_code, cutoff)
@@ -532,6 +534,10 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
     ) - timedelta(hours=settings.GRID_RETENTION_HOURS)
     source_start = retention_start - timedelta(hours=2)
     with db_connection() as connection:
+        hour = source_start
+        while hour < datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0):
+            ensure_historical_weather(connection, hour)
+            hour += timedelta(hours=1)
         analysis_source_rows = fetch_all(
             connection,
             """

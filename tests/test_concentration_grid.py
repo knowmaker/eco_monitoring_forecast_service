@@ -146,7 +146,7 @@ def test_analysis_uses_one_field_without_cluster_identifiers():
     assert (analysis["west"] < analysis["east"]).all()
 
 
-def test_single_station_influence_never_exceeds_ten_kilometers():
+def test_single_station_influence_fades_beyond_ten_kilometers():
     anchor = _anchors().iloc[:1]
     analysis = assimilate_observations(anchor, None)
     latitude = float(anchor.iloc[0].latitude)
@@ -159,8 +159,10 @@ def test_single_station_influence_never_exceeds_ten_kilometers():
     )
     distances = np.hypot(east, north)
 
-    assert distances.max() <= 10_000.01
-    assert distances.max() > 5_000.0
+    assert 10_000.0 < distances.max() < 15_000.0
+    inner = analysis.iloc[int(np.argmin(np.abs(distances - 9_000.0)))]
+    outer = analysis.iloc[int(np.argmin(np.abs(distances - 12_000.0)))]
+    assert inner["confidence"] > outer["confidence"] > 0.02
 
 
 def test_observation_influence_is_longer_along_wind_than_across_it():
@@ -202,10 +204,10 @@ def test_stations_with_overlapping_influence_have_a_field_between_them():
     assert middle["confidence"] > 0.0
 
 
-def test_stations_farther_than_two_influence_radii_leave_a_gap():
+def test_distant_stations_leave_a_gap():
     latitude = 55.75
     longitude = 37.6
-    second_latitude, second_longitude = _offset(latitude, longitude, 25_000.0, 0.0)
+    second_latitude, second_longitude = _offset(latitude, longitude, 35_000.0, 0.0)
     anchors = pd.DataFrame([
         {"monitoring_post_id": 1, "latitude": latitude, "longitude": longitude, "value": 0.02},
         {
@@ -217,7 +219,7 @@ def test_stations_farther_than_two_influence_radii_leave_a_gap():
     ])
 
     analysis = assimilate_observations(anchors, None)
-    middle_latitude, middle_longitude = _offset(latitude, longitude, 12_500.0, 0.0)
+    middle_latitude, middle_longitude = _offset(latitude, longitude, 17_500.0, 0.0)
     middle = _nearest_row(analysis, middle_latitude, middle_longitude)
     north = (middle["latitude"] - middle_latitude) * 111_320.0
     east = (
@@ -336,6 +338,31 @@ def test_nowcast_uses_historical_weather_when_live_station_weather_is_missing():
     weather_sources = _attach_live_weather(sources, live)
 
     assert weather_sources["weather_wind_speed"].tolist() == [5.0, 3.0]
+
+
+def test_analysis_wind_uses_only_historical_weather():
+    hour = datetime(2026, 10, 20, 5, tzinfo=timezone.utc)
+    historical = pd.DataFrame([
+        {"monitoring_post_id": 1, "hor_win_spd": 2.0, "hor_win_dir": 90.0},
+    ])
+    live = pd.DataFrame([
+        {"monitoring_post_id": 1, "hor_win_spd": 8.0, "hor_win_dir": 90.0},
+        {"monitoring_post_id": 2, "hor_win_spd": 4.0, "hor_win_dir": 90.0},
+    ])
+
+    speed, direction = stored_grids._mean_wind_frame(
+        {("historical_forecast", hour): historical, ("live_forecast", hour): live},
+        hour,
+        "historical_forecast",
+        [1, 2],
+    )
+
+    assert speed == 2.0
+    assert direction == 90.0
+
+    assert stored_grids._mean_wind_frame(
+        {("live_forecast", hour): live}, hour, "historical_forecast", [1, 2]
+    ) == (None, None)
 
 
 def test_zero_concentration_nowcast_remains_available():

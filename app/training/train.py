@@ -14,12 +14,18 @@ from app.training.backtest import chronological_split, regression_metrics, resid
 from app.training.model_store import get_current_model, replace_current_model
 
 
-def _training_frame(connection) -> pd.DataFrame:
+def _training_frame(connection, *, history_start=None, history_end=None) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for substance_code in get_settings().active_gases:
         frame = add_physical_baseline(
             add_spatial_features(
-                build_local_frame(connection, substance_code, include_target=True), substance_code
+                build_local_frame(
+                    connection,
+                    substance_code,
+                    include_target=True,
+                    history_start=history_start,
+                    history_end=history_end,
+                ), substance_code
             )
         )
         frame["correction_target"] = frame["target_value"] - frame["physical_baseline"]

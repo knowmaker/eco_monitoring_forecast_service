@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
 
+import pytest
+
+from app.features import weather_features
 from app.features.weather_features import _weather_rows
 
 
@@ -27,3 +30,28 @@ def test_open_meteo_payload_is_mapped_to_internal_units():
     assert row[7] == 1002.4
     assert row[8] == 3.2
     assert row[9] == 225.0
+
+
+def test_historical_weather_is_synced_only_when_missing(monkeypatch):
+    hour = datetime(2026, 10, 21, 9, tzinfo=timezone.utc)
+    missing = iter([{"missing": 2}, {"missing": 0}, {"missing": 0}])
+    synced = []
+    monkeypatch.setattr(weather_features, "fetch_one", lambda *_: next(missing))
+    monkeypatch.setattr(
+        weather_features,
+        "sync_historical_weather",
+        lambda _, start, end: synced.append((start, end)) or 24,
+    )
+
+    assert weather_features.ensure_historical_weather(object(), hour) == 24
+    assert weather_features.ensure_historical_weather(object(), hour) == 0
+    assert synced == [(hour.date(), hour.date())]
+
+
+def test_historical_weather_remains_missing_after_sync(monkeypatch):
+    hour = datetime(2026, 10, 21, 9, tzinfo=timezone.utc)
+    monkeypatch.setattr(weather_features, "fetch_one", lambda *_: {"missing": 1})
+    monkeypatch.setattr(weather_features, "sync_historical_weather", lambda *_: 0)
+
+    with pytest.raises(RuntimeError, match="Historical weather is incomplete"):
+        weather_features.ensure_historical_weather(object(), hour)

@@ -197,21 +197,23 @@ def _anisotropic_correlation(
 ) -> np.ndarray:
     delta_x = target_x[:, None] - source_x[None, :]
     delta_y = target_y[:, None] - source_y[None, :]
-    distances = np.hypot(delta_x, delta_y)
     speed = np.hypot(source_wind_u, source_wind_v)
     unit_u = np.divide(source_wind_u, speed, out=np.zeros_like(speed), where=speed > 0.1)
     unit_v = np.divide(source_wind_v, speed, out=np.ones_like(speed), where=speed > 0.1)
     along = delta_x * unit_u[None, :] + delta_y * unit_v[None, :]
     across = -delta_x * unit_v[None, :] + delta_y * unit_u[None, :]
 
-    sigma_along = radius / np.sqrt(-2.0 * np.log(COVARIANCE_AT_RADIUS))
+    sigma_along = radius / np.sqrt(2.0)
     anisotropy = 1.0 + np.minimum(speed / 5.0, 2.0)
     sigma_across = sigma_along / anisotropy
     sigma_across = np.where(speed <= 0.1, sigma_along, sigma_across)
     normalized = (along / sigma_along) ** 2 + (across / sigma_across[None, :]) ** 2
-    correlation = np.exp(-0.5 * normalized)
-    correlation[distances > radius] = 0.0
-    return correlation
+    return np.exp(-0.5 * normalized)
+
+
+def _observation_support_radius(radius: float) -> float:
+    confidence_floor = max(get_settings().GRID_MIN_CONFIDENCE, 1e-6)
+    return radius * max(1.0, np.sqrt(-np.log(confidence_floor) / 2.0))
 
 
 def _sample_grid(
@@ -484,7 +486,7 @@ def assimilate_observations(
         support_x,
         support_y,
         step,
-        radius,
+        _observation_support_radius(radius),
     )
 
     if prior.empty:
@@ -552,11 +554,7 @@ def assimilate_observations(
         values = np.maximum(values + backward_increment * (1.0 - confidence), 0.0)
         confidence = np.maximum(confidence, backward_confidence)
 
-    station_distance = cKDTree(np.column_stack((observation_x, observation_y))).query(
-        np.column_stack((grid_x, grid_y)),
-        k=1,
-    )[0]
-    observation_coverage = station_distance <= radius
+    observation_coverage = confidence - background_confidence >= settings.GRID_MIN_CONFIDENCE
     backward_coverage = backward_confidence >= settings.GRID_MIN_CONFIDENCE
     keep = (
         np.isfinite(values)
@@ -850,7 +848,11 @@ def build_semiphysical_forecast_grid(
     diffusion_padding = 3.0 * np.sqrt(
         2.0 * settings.PHYSICS_MAX_DIFFUSIVITY_M2_S * duration_seconds
     )
-    padding = max(radius if len(anchor_x) else 0.0, diffusion_padding, 2.0 * step)
+    padding = max(
+        _observation_support_radius(radius) if len(anchor_x) or not weather_sources.empty else 0.0,
+        diffusion_padding,
+        2.0 * step,
+    )
     x_values, y_values, grid_x, grid_y, x_min, y_min = _grid_extent(
         support_x,
         support_y,
@@ -971,11 +973,7 @@ def build_semiphysical_forecast_grid(
             )[0]
         else:
             upper_bounds = np.full_like(values, np.nan)
-        station_distance = cKDTree(np.column_stack((correction_x, correction_y))).query(
-            np.column_stack((grid_x, grid_y)),
-            k=1,
-        )[0]
-        station_coverage = station_distance <= radius
+        station_coverage = confidence - transported_confidence >= settings.GRID_MIN_CONFIDENCE
 
     transported_coverage = transported_confidence >= settings.GRID_MIN_CONFIDENCE
     significant = values >= settings.PHYSICS_MIN_CONCENTRATION
