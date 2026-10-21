@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -324,7 +324,7 @@ def test_nowcast_retains_latest_station_value_after_wind_transport():
     assert nearest["confidence"] > 0.1
 
 
-def test_nowcast_uses_historical_weather_when_live_station_weather_is_missing():
+def test_nowcast_keeps_previous_weather_when_current_station_weather_is_missing():
     sources = _anchors().iloc[:2].copy()
     sources["weather_wind_speed"] = [2.0, 3.0]
     live = pd.DataFrame([{
@@ -340,29 +340,26 @@ def test_nowcast_uses_historical_weather_when_live_station_weather_is_missing():
     assert weather_sources["weather_wind_speed"].tolist() == [5.0, 3.0]
 
 
-def test_analysis_wind_uses_only_historical_weather():
+def test_analysis_wind_uses_live_weather():
     hour = datetime(2026, 10, 20, 5, tzinfo=timezone.utc)
-    historical = pd.DataFrame([
-        {"monitoring_post_id": 1, "hor_win_spd": 2.0, "hor_win_dir": 90.0},
-    ])
     live = pd.DataFrame([
         {"monitoring_post_id": 1, "hor_win_spd": 8.0, "hor_win_dir": 90.0},
         {"monitoring_post_id": 2, "hor_win_spd": 4.0, "hor_win_dir": 90.0},
     ])
+    next_hour = hour + timedelta(hours=1)
+    next_live = pd.DataFrame([
+        {"monitoring_post_id": 1, "hor_win_spd": 2.0, "hor_win_dir": 180.0},
+    ])
+    weather_by_hour = {hour: live, next_hour: next_live}
 
     speed, direction = stored_grids._mean_wind_frame(
-        {("historical_forecast", hour): historical, ("live_forecast", hour): live},
-        hour,
-        "historical_forecast",
-        [1, 2],
+        weather_by_hour, hour, [1, 2]
     )
 
-    assert speed == 2.0
+    assert speed == 6.0
     assert direction == 90.0
-
-    assert stored_grids._mean_wind_frame(
-        {("live_forecast", hour): live}, hour, "historical_forecast", [1, 2]
-    ) == (None, None)
+    assert stored_grids._mean_wind_frame(weather_by_hour, next_hour, [1, 2]) == (2.0, 180.0)
+    assert stored_grids._mean_wind_frame({}, hour, [1, 2]) == (None, None)
 
 
 def test_zero_concentration_nowcast_remains_available():

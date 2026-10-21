@@ -190,36 +190,6 @@ def sync_historical_weather(
     return total
 
 
-def ensure_historical_weather(connection: Connection, hour_start: datetime) -> int:
-    def missing_count() -> int:
-        row = fetch_one(
-            connection,
-            """
-            SELECT count(*) AS missing
-            FROM public.monitoring_posts p
-            LEFT JOIN public.external_weather_hourly w
-              ON w.monitoring_post_id = p.id
-             AND w.bucket_start = %s
-             AND w.data_kind = 'historical_forecast'
-            WHERE p.active_to IS NULL
-              AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
-              AND (w.monitoring_post_id IS NULL
-                   OR w.hor_win_spd IS NULL OR w.hor_win_dir IS NULL
-                   OR w.wind_speed_100m IS NULL OR w.wind_direction_100m IS NULL)
-            """,
-            (hour_start,),
-        )
-        return int(row["missing"])
-
-    if not missing_count():
-        return 0
-    day = hour_start.astimezone(timezone.utc).date()
-    rows = sync_historical_weather(connection, day, day)
-    if missing_count():
-        raise RuntimeError(f"Historical weather is incomplete for {hour_start.isoformat()}")
-    return rows
-
-
 def sync_live_weather(connection: Connection) -> int:
     total = 0
     settings = get_settings()

@@ -16,7 +16,7 @@ from app.features.concentration_grid import (
     assimilate_observations,
     build_semiphysical_forecast_grid,
 )
-from app.features.weather_features import ensure_historical_weather
+from app.features.weather_features import sync_live_weather
 
 
 def _anchor_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -54,7 +54,7 @@ def _analysis_anchors(connection: Connection, substance_code: str, hour_start: d
             LEFT JOIN public.external_weather_hourly w
               ON w.monitoring_post_id = h.monitoring_post_id
              AND w.bucket_start = h.bucket_start
-             AND w.data_kind = 'historical_forecast'
+             AND w.data_kind = 'live_forecast'
             WHERE h.substance_code = %s AND h.bucket_start = %s
               AND h.filtered_hourly_mean IS NOT NULL
               AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
@@ -110,20 +110,16 @@ def _nowcast_weather_anchors(
             SELECT h.monitoring_post_id, p.latitude, p.longitude,
                    GREATEST(h.filtered_hourly_mean, 0.0) AS value,
                    h.samples_count, p.source,
-                   COALESCE(w.wind_speed_100m, old_w.wind_speed_100m) AS weather_wind_speed,
-                   COALESCE(w.wind_direction_100m, old_w.wind_direction_100m) AS weather_wind_direction,
-                   COALESCE(w.boundary_layer_height, old_w.boundary_layer_height) AS weather_boundary_layer_height,
-                   COALESCE(w.precipitation, old_w.precipitation) AS weather_precipitation
+                   w.wind_speed_100m AS weather_wind_speed,
+                   w.wind_direction_100m AS weather_wind_direction,
+                   w.boundary_layer_height AS weather_boundary_layer_height,
+                   w.precipitation AS weather_precipitation
             FROM public.gas_hourly_features h
             JOIN public.monitoring_posts p ON p.id = h.monitoring_post_id
             LEFT JOIN public.external_weather_hourly w
               ON w.monitoring_post_id = h.monitoring_post_id
              AND w.bucket_start = %s
              AND w.data_kind = 'live_forecast'
-            LEFT JOIN public.external_weather_hourly old_w
-              ON old_w.monitoring_post_id = h.monitoring_post_id
-             AND old_w.bucket_start = h.bucket_start
-             AND old_w.data_kind = 'historical_forecast'
             WHERE h.substance_code = %s AND h.bucket_start = %s
               AND h.filtered_hourly_mean IS NOT NULL
               AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
@@ -137,7 +133,6 @@ def _nowcast_weather_anchors(
 def _mean_wind(
     connection: Connection,
     hour_start: datetime,
-    data_kind: str,
     station_ids: list[int],
 ) -> tuple[float | None, float | None]:
     if not station_ids:
@@ -147,11 +142,11 @@ def _mean_wind(
         """
         SELECT hor_win_spd, hor_win_dir
         FROM public.external_weather_hourly
-        WHERE bucket_start = %s AND data_kind = %s
+        WHERE bucket_start = %s AND data_kind = 'live_forecast'
           AND monitoring_post_id = ANY(%s)
           AND hor_win_spd IS NOT NULL AND hor_win_dir IS NOT NULL
         """,
-        (hour_start, data_kind, station_ids),
+        (hour_start, station_ids),
     )
     if not rows:
         return None, None
@@ -164,7 +159,6 @@ def _mean_wind(
 def _mean_weather(
     connection: Connection,
     hour_start: datetime,
-    data_kind: str,
     station_ids: list[int],
 ) -> dict[str, float | None]:
     if not station_ids:
@@ -180,10 +174,10 @@ def _mean_weather(
         SELECT hor_win_spd, hor_win_dir, wind_speed_100m, wind_direction_100m,
                boundary_layer_height, precipitation
         FROM public.external_weather_hourly
-        WHERE bucket_start = %s AND data_kind = %s
+        WHERE bucket_start = %s AND data_kind = 'live_forecast'
           AND monitoring_post_id = ANY(%s)
         """,
-        (hour_start, data_kind, station_ids),
+        (hour_start, station_ids),
     )
     if not rows:
         return {
@@ -320,12 +314,11 @@ def _replace_grid(
 
 
 def _mean_wind_frame(
-    weather_by_hour: dict[tuple[str, datetime], pd.DataFrame],
+    weather_by_hour: dict[datetime, pd.DataFrame],
     hour_start: datetime,
-    data_kind: str,
     station_ids: list[int],
 ) -> tuple[float | None, float | None]:
-    weather = weather_by_hour.get((data_kind, hour_start))
+    weather = weather_by_hour.get(hour_start)
     if weather is None or weather.empty:
         return None, None
     selected = weather[weather["monitoring_post_id"].isin(station_ids)].dropna(
@@ -343,12 +336,11 @@ def _mean_wind_frame(
 
 
 def _mean_weather_frame(
-    weather_by_hour: dict[tuple[str, datetime], pd.DataFrame],
+    weather_by_hour: dict[datetime, pd.DataFrame],
     hour_start: datetime,
-    data_kind: str,
     station_ids: list[int],
 ) -> dict[str, float | None]:
-    weather = weather_by_hour.get((data_kind, hour_start))
+    weather = weather_by_hour.get(hour_start)
     if weather is None or weather.empty:
         return {
             "wind_speed": None,
@@ -425,7 +417,6 @@ def build_analysis_grid(connection: Connection, substance_code: str, hour_start:
     wind_speed, wind_direction = _mean_wind(
         connection,
         hour_start,
-        "historical_forecast",
         station_ids,
     )
     prior = _stored_grid(connection, substance_code, hour_start, "forecast")
@@ -450,7 +441,7 @@ def build_nowcast_grid(connection: Connection, substance_code: str, hour_start: 
         weather_anchors["monitoring_post_id"].astype(int).tolist()
         if not weather_anchors.empty else []
     )
-    weather = _mean_weather(connection, hour_start, "live_forecast", station_ids)
+    weather = _mean_weather(connection, hour_start, station_ids)
     grid = build_semiphysical_forecast_grid(
         analysis,
         pd.DataFrame(),
@@ -482,7 +473,6 @@ def build_forecast_grid(connection: Connection, substance_code: str, hour_start:
     weather = _mean_weather(
         connection,
         data_cutoff if data_cutoff is not None else hour_start,
-        "live_forecast",
         station_ids,
     )
     nowcast = (
@@ -508,7 +498,6 @@ def refresh_concentration_grids(cutoff: datetime) -> dict[str, int]:
     forecast_hour = cutoff + timedelta(hours=1)
     counts = {"analysis": 0, "forecast": 0}
     with db_connection() as connection:
-        ensure_historical_weather(connection, analysis_hour)
         for substance_code in get_settings().active_gases:
             counts["analysis"] += build_analysis_grid(connection, substance_code, analysis_hour)
             counts["forecast"] += build_nowcast_grid(connection, substance_code, cutoff)
@@ -534,10 +523,7 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
     ) - timedelta(hours=settings.GRID_RETENTION_HOURS)
     source_start = retention_start - timedelta(hours=2)
     with db_connection() as connection:
-        hour = source_start
-        while hour < datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0):
-            ensure_historical_weather(connection, hour)
-            hour += timedelta(hours=1)
+        sync_live_weather(connection)
         analysis_source_rows = fetch_all(
             connection,
             """
@@ -556,7 +542,7 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
             LEFT JOIN public.external_weather_hourly w
               ON w.monitoring_post_id = h.monitoring_post_id
              AND w.bucket_start = h.bucket_start
-             AND w.data_kind = 'historical_forecast'
+             AND w.data_kind = 'live_forecast'
             WHERE h.substance_code = ANY(%s)
               AND h.bucket_start >= %s
               AND h.filtered_hourly_mean IS NOT NULL
@@ -589,11 +575,10 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
         weather_rows = fetch_all(
             connection,
             """
-            SELECT monitoring_post_id, bucket_start, data_kind, hor_win_spd, hor_win_dir,
+            SELECT monitoring_post_id, bucket_start, hor_win_spd, hor_win_dir,
                    wind_speed_100m, wind_direction_100m, boundary_layer_height, precipitation
             FROM public.external_weather_hourly
-            WHERE data_kind IN ('historical_forecast', 'live_forecast')
-              AND bucket_start >= %s
+            WHERE data_kind = 'live_forecast' AND bucket_start >= %s
             """,
             (source_start,),
         )
@@ -602,11 +587,8 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
         weather = pd.DataFrame(weather_rows)
         weather_by_hour = (
             {
-                (data_kind, hour_start): group
-                for (data_kind, hour_start), group in weather.groupby(
-                    ["data_kind", "bucket_start"],
-                    sort=False,
-                )
+                hour_start: group
+                for hour_start, group in weather.groupby("bucket_start", sort=False)
             }
             if not weather.empty
             else {}
@@ -638,7 +620,6 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
             wind_speed, wind_direction = _mean_wind_frame(
                 weather_by_hour,
                 hour_start,
-                "historical_forecast",
                 station_ids,
             )
             analysis_grid = assimilate_observations(
@@ -658,12 +639,11 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
             if analysis_grid.empty:
                 continue
             cutoff = hour_start + timedelta(hours=1)
-            weather_at_cutoff = weather_by_hour.get(("live_forecast", cutoff))
+            weather_at_cutoff = weather_by_hour.get(cutoff)
             weather_sources = _attach_live_weather(anchors, weather_at_cutoff)
             weather_values = _mean_weather_frame(
                 weather_by_hour,
                 cutoff,
-                "live_forecast",
                 station_ids,
             )
             nowcast_grid = build_semiphysical_forecast_grid(
@@ -694,7 +674,6 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
                 forecast_weather = _mean_weather_frame(
                     weather_by_hour,
                     cutoff,
-                    "live_forecast",
                     forecast_station_ids,
                 )
                 forecast_grid = build_semiphysical_forecast_grid(
@@ -732,6 +711,8 @@ def main() -> None:
     if cutoff.tzinfo is None:
         cutoff = cutoff.replace(tzinfo=timezone.utc)
     cutoff = cutoff.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    with db_connection() as connection:
+        sync_live_weather(connection)
     print(refresh_concentration_grids(cutoff))
 
 
