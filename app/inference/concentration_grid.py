@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
-from math import atan2, degrees, radians
+from math import atan2, degrees
 from typing import Any
 
 import numpy as np
