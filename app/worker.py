@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.db import db_connection, fetch_all
 from app.features.hourly_gas import refresh_hourly_gas_features
 from app.features.weather_features import sync_live_weather
+from app.features.horizons import FORECAST_HORIZONS
 from app.inference.runner import current_cutoff, run_forecast
 from app.models.base import deserialize_artifact
 from app.training.model_store import get_current_model
@@ -21,6 +22,7 @@ def _cutoffs_to_rebuild(
     expected: list[dict[str, object]],
     existing: list[dict[str, object]],
     due_cutoff: datetime,
+    *, forecast_horizons: tuple[int, ...] = FORECAST_HORIZONS,
 ) -> list[datetime]:
     existing_frames = {
         (row["hour_start"], row["data_kind"], row["substance_code"]): row.get("generated_at")
@@ -37,12 +39,18 @@ def _cutoffs_to_rebuild(
         eligible_cutoffs.add(cutoff)
         analysis_key = (source_hour, "analysis", substance_code)
         nowcast_key = (cutoff, "forecast", substance_code)
-        forecast_key = (source_hour + timedelta(hours=2), "forecast", substance_code)
+        forecast_keys = [
+            (source_hour + timedelta(hours=hour), "forecast", substance_code)
+            for hour in forecast_horizons
+        ]
         analysis_generated = existing_frames.get(analysis_key)
         nowcast_generated = existing_frames.get(nowcast_key)
         if (
             analysis_key not in existing_frames
-            or (row["forecast_expected"] and forecast_key not in existing_frames)
+            or (
+                row["forecast_expected"]
+                and any(key not in existing_frames for key in forecast_keys)
+            )
             or (
                 cutoff == due_cutoff
                 and (
@@ -68,6 +76,7 @@ def missing_grid_cutoffs(due_cutoff: datetime) -> list[datetime]:
     earliest_cutoff = due_cutoff - timedelta(hours=settings.FORECAST_CATCHUP_HOURS - 1)
     source_start = earliest_cutoff - timedelta(hours=1)
     with db_connection(readonly=True) as connection:
+        horizons = FORECAST_HORIZONS
         expected = fetch_all(
             connection,
             """
@@ -77,7 +86,8 @@ def missing_grid_cutoffs(due_cutoff: datetime) -> list[datetime]:
                        FROM public.gas_predictions f
                        WHERE f.substance_code = h.substance_code
                          AND f.data_cutoff = h.bucket_start + INTERVAL '1 hour'
-                         AND f.target_start = h.bucket_start + INTERVAL '2 hours'
+                         AND f.target_start BETWEEN h.bucket_start + INTERVAL '1 hour'
+                                                AND h.bucket_start + INTERVAL '5 hours'
                          AND f.status = 'ready'
                    ) AS forecast_expected
             FROM public.gas_hourly_features h
@@ -105,11 +115,13 @@ def missing_grid_cutoffs(due_cutoff: datetime) -> list[datetime]:
             (
                 list(settings.active_gases),
                 source_start,
-                due_cutoff + timedelta(hours=1),
+                due_cutoff + timedelta(hours=max(horizons) - 1),
             ),
         )
 
-    return _cutoffs_to_rebuild(expected, existing, due_cutoff)
+    return _cutoffs_to_rebuild(
+        expected, existing, due_cutoff, forecast_horizons=horizons,
+    )
 
 
 def run_due_forecasts(now: datetime | None = None) -> dict[str, object]:
@@ -149,7 +161,9 @@ def ensure_model() -> None:
         try:
             artifact = deserialize_artifact(model["artifact"])
             if (
-                artifact.metadata.get("prediction_mode") == "physical_residual"
+                artifact.metadata.get("model_type") == "per_gas_five_hour"
+                and tuple(artifact.metadata.get("forecast_horizons", ())) == FORECAST_HORIZONS
+                and artifact.metadata.get("prediction_mode") == "physical_residual"
                 and "monitoring_post_id" not in artifact.feature_columns
                 and artifact.metadata.get("active_gases") == list(get_settings().active_gases)
             ):
@@ -158,7 +172,7 @@ def ensure_model() -> None:
         except Exception as error:
             logging.warning("Current model cannot be loaded and will be replaced: %s", error)
 
-    logging.info("Training the current semi-physical correction model")
+    logging.info("Training six gas-specific five-hour forecast models")
     from app.training.train import train_and_replace
 
     result = train_and_replace()

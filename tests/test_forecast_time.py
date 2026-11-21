@@ -54,6 +54,21 @@ def test_existing_nowcast_needs_no_station_prediction():
     assert _cutoffs_to_rebuild(expected, existing, source_hour + timedelta(hours=1)) == []
 
 
+def test_five_hour_rebuild_detects_a_missing_later_forecast_grid():
+    source_hour = datetime(2026, 9, 25, 9, 0, tzinfo=timezone.utc)
+    expected = [{"bucket_start": source_hour, "substance_code": "NO2", "forecast_expected": True}]
+    existing = [{"hour_start": source_hour, "data_kind": "analysis", "substance_code": "NO2"}]
+    existing += [
+        {"hour_start": source_hour + timedelta(hours=hour),
+         "data_kind": "forecast", "substance_code": "NO2"}
+        for hour in (1, 2, 3, 5)
+    ]
+    assert _cutoffs_to_rebuild(
+        expected, existing, source_hour + timedelta(hours=1),
+        forecast_horizons=(1, 2, 3, 4, 5),
+    ) == [source_hour + timedelta(hours=1)]
+
+
 def test_stale_forecast_for_current_hour_is_rebuilt_as_nowcast():
     source_hour = datetime(2026, 9, 25, 9, 0, tzinfo=timezone.utc)
     expected = [
@@ -85,7 +100,7 @@ def test_stale_forecast_for_current_hour_is_rebuilt_as_nowcast():
     ) == [source_hour + timedelta(hours=1)]
 
 
-def test_old_historical_forecast_does_not_trigger_full_backfill():
+def test_complete_historical_forecast_does_not_trigger_full_backfill():
     source_hour = datetime(2026, 9, 25, 9, 0, tzinfo=timezone.utc)
     expected = [
         {"bucket_start": source_hour, "substance_code": "NO2", "forecast_expected": True}
@@ -103,11 +118,14 @@ def test_old_historical_forecast_does_not_trigger_full_backfill():
             "substance_code": "NO2",
             "generated_at": source_hour + timedelta(hours=1),
         },
+    ]
+    existing += [
         {
-            "hour_start": source_hour + timedelta(hours=2),
+            "hour_start": source_hour + timedelta(hours=hour),
             "data_kind": "forecast",
             "substance_code": "NO2",
-        },
+        }
+        for hour in (2, 3, 4, 5)
     ]
 
     assert _cutoffs_to_rebuild(expected, existing, source_hour + timedelta(hours=2)) == []

@@ -140,6 +140,7 @@ def build_local_frame(
     history_start: object | None = None,
     history_end: object | None = None,
     weather_data_kind: str = "historical_forecast",
+    exclude_post_ids: frozenset[int] | None = None,
 ) -> pd.DataFrame:
     target_substance = target_substance.upper()
     settings = get_settings()
@@ -148,6 +149,11 @@ def build_local_frame(
         return pd.DataFrame()
     gas = gas[gas["substance_code"].isin(settings.active_gases)].copy()
     posts = load_posts(connection)
+    if exclude_post_ids:
+        gas = gas[~gas["monitoring_post_id"].isin(exclude_post_ids)].copy()
+        posts = posts[~posts["monitoring_post_id"].isin(exclude_post_ids)].copy()
+        if gas.empty:
+            return pd.DataFrame()
     inference_grid_end = None
     inference_post_ids = None
     if not include_target and history_end is not None:
@@ -279,6 +285,8 @@ def inference_rows_for_cutoff(
     connection: Connection,
     substance_code: str,
     cutoff: datetime,
+    *,
+    exclude_post_ids: frozenset[int] | None = None,
 ) -> pd.DataFrame:
     cutoff_timestamp = pd.Timestamp(cutoff)
     if cutoff_timestamp.tzinfo is None:
@@ -292,6 +300,7 @@ def inference_rows_for_cutoff(
         history_start=cutoff_timestamp - pd.Timedelta(hours=get_settings().FEATURE_LOOKBACK_HOURS),
         history_end=cutoff_timestamp,
         weather_data_kind="live_forecast",
+        exclude_post_ids=exclude_post_ids,
     )
     if frame.empty:
         return frame

@@ -16,6 +16,7 @@ from app.features.concentration_grid import (
     assimilate_observations,
     build_semiphysical_forecast_grid,
 )
+from app.features.horizons import FORECAST_HORIZONS
 from app.features.weather_features import sync_live_weather
 
 
@@ -85,7 +86,7 @@ def _forecast_anchors(connection: Connection, substance_code: str, hour_start: d
              AND h.filtered_hourly_mean IS NOT NULL
             LEFT JOIN public.external_weather_hourly w
               ON w.monitoring_post_id = f.monitoring_post_id
-             AND w.bucket_start = f.data_cutoff
+             AND w.bucket_start = f.target_start
              AND w.data_kind = 'live_forecast'
             WHERE f.substance_code = %s AND f.target_start = %s
               AND f.status = 'ready' AND f.predicted_value IS NOT NULL
@@ -429,7 +430,10 @@ def build_analysis_grid(connection: Connection, substance_code: str, hour_start:
     return _replace_grid(connection, substance_code, hour_start, "analysis", grid)
 
 
-def build_nowcast_grid(connection: Connection, substance_code: str, hour_start: datetime) -> int:
+def build_nowcast_grid(
+    connection: Connection, substance_code: str, hour_start: datetime,
+    *, use_model_anchors: bool = False,
+) -> int:
     source_hour = hour_start - timedelta(hours=1)
     analysis = _stored_grid(connection, substance_code, source_hour, "analysis")
     if analysis.empty:
@@ -442,9 +446,13 @@ def build_nowcast_grid(connection: Connection, substance_code: str, hour_start: 
         if not weather_anchors.empty else []
     )
     weather = _mean_weather(connection, hour_start, station_ids)
+    anchors = (
+        _forecast_anchors(connection, substance_code, hour_start)
+        if use_model_anchors else pd.DataFrame()
+    )
     grid = build_semiphysical_forecast_grid(
         analysis,
-        pd.DataFrame(),
+        anchors,
         substance_code=substance_code,
         wind_speed=weather["wind_speed"],
         wind_from_degrees=weather["wind_direction"],
@@ -457,51 +465,42 @@ def build_nowcast_grid(connection: Connection, substance_code: str, hour_start: 
     return _replace_grid(connection, substance_code, hour_start, "forecast", grid)
 
 
-def build_forecast_grid(connection: Connection, substance_code: str, hour_start: datetime) -> int:
+def build_forecast_grid(
+    connection: Connection, substance_code: str, hour_start: datetime,
+) -> int:
     anchors = _forecast_anchors(connection, substance_code, hour_start)
     station_ids = anchors["monitoring_post_id"].astype(int).tolist() if not anchors.empty else []
-    cutoff = fetch_one(
-        connection,
-        """
-        SELECT max(data_cutoff) AS data_cutoff
-        FROM public.gas_predictions
-        WHERE substance_code = %s AND target_start = %s AND status = 'ready'
-        """,
-        (substance_code, hour_start),
-    )
-    data_cutoff = cutoff["data_cutoff"] if cutoff else None
-    weather = _mean_weather(
-        connection,
-        data_cutoff if data_cutoff is not None else hour_start,
-        station_ids,
-    )
-    nowcast = (
-        _stored_grid(connection, substance_code, data_cutoff, "forecast")
-        if data_cutoff is not None
-        else pd.DataFrame()
+    previous_hour = hour_start - timedelta(hours=1)
+    weather = _mean_weather(connection, hour_start, station_ids)
+    previous = (
+        _stored_grid(connection, substance_code, previous_hour, "forecast")
     )
     grid = build_semiphysical_forecast_grid(
-        nowcast,
+        previous,
         anchors,
         substance_code=substance_code,
         wind_speed=weather["wind_speed"],
         wind_from_degrees=weather["wind_direction"],
         boundary_layer_height=weather["boundary_layer_height"],
         precipitation=weather["precipitation"],
-        duration_seconds=(hour_start - data_cutoff).total_seconds() if data_cutoff else 3600.0,
+        duration_seconds=3600.0,
     )
     return _replace_grid(connection, substance_code, hour_start, "forecast", grid)
 
 
 def refresh_concentration_grids(cutoff: datetime) -> dict[str, int]:
     analysis_hour = cutoff - timedelta(hours=1)
-    forecast_hour = cutoff + timedelta(hours=1)
     counts = {"analysis": 0, "forecast": 0}
     with db_connection() as connection:
         for substance_code in get_settings().active_gases:
             counts["analysis"] += build_analysis_grid(connection, substance_code, analysis_hour)
-            counts["forecast"] += build_nowcast_grid(connection, substance_code, cutoff)
-            counts["forecast"] += build_forecast_grid(connection, substance_code, forecast_hour)
+            counts["forecast"] += build_nowcast_grid(
+                connection, substance_code, cutoff, use_model_anchors=True,
+            )
+            for offset in range(1, len(FORECAST_HORIZONS)):
+                counts["forecast"] += build_forecast_grid(
+                    connection, substance_code, cutoff + timedelta(hours=offset),
+                )
         retention_start = cutoff - timedelta(hours=get_settings().GRID_RETENTION_HOURS)
         with connection.cursor() as cursor:
             cursor.execute(
@@ -646,9 +645,19 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
                 cutoff,
                 station_ids,
             )
+            source_forecast = forecast_by_source.get((substance_code, hour_start))
+            anchors_by_target = (
+                {target: group for target, group in source_forecast.groupby("hour_start")}
+                if source_forecast is not None else {}
+            )
+            first_anchors = anchors_by_target.get(cutoff)
+            first_anchors = (
+                _attach_live_weather(first_anchors.copy(), weather_at_cutoff)
+                if first_anchors is not None else pd.DataFrame()
+            )
             nowcast_grid = build_semiphysical_forecast_grid(
                 analysis_grid,
-                pd.DataFrame(),
+                first_anchors,
                 substance_code=substance_code,
                 wind_speed=weather_values["wind_speed"],
                 wind_from_degrees=weather_values["wind_direction"],
@@ -664,30 +673,39 @@ def backfill_concentration_grids(substance_codes: tuple[str, ...] | None = None)
                     connection, substance_code, cutoff, "forecast", nowcast_grid
                 )
 
-            forecast_anchors = forecast_by_source.get((substance_code, hour_start))
-            if forecast_anchors is not None and not forecast_anchors.empty:
-                forecast_anchors = _attach_live_weather(
-                    forecast_anchors.copy(), weather_at_cutoff
+            previous_grid = nowcast_grid
+            for horizon in FORECAST_HORIZONS[1:]:
+                target_hour = hour_start + timedelta(hours=horizon)
+                forecast_anchors = anchors_by_target.get(target_hour)
+                forecast_anchors = (
+                    _attach_live_weather(
+                        forecast_anchors.copy(), weather_by_hour.get(target_hour)
+                    ) if forecast_anchors is not None else pd.DataFrame()
                 )
-                target_hour = forecast_anchors["hour_start"].max()
-                forecast_station_ids = forecast_anchors["monitoring_post_id"].astype(int).tolist()
+                forecast_station_ids = (
+                    forecast_anchors["monitoring_post_id"].astype(int).tolist()
+                    if not forecast_anchors.empty else []
+                )
                 forecast_weather = _mean_weather_frame(
                     weather_by_hour,
-                    cutoff,
+                    target_hour,
                     forecast_station_ids,
                 )
                 forecast_grid = build_semiphysical_forecast_grid(
-                    nowcast_grid,
+                    previous_grid,
                     forecast_anchors,
                     substance_code=substance_code,
                     wind_speed=forecast_weather["wind_speed"],
                     wind_from_degrees=forecast_weather["wind_direction"],
                     boundary_layer_height=forecast_weather["boundary_layer_height"],
                     precipitation=forecast_weather["precipitation"],
-                    duration_seconds=(target_hour - cutoff).total_seconds(),
+                    duration_seconds=3600.0,
                 )
-                if not forecast_grid.empty:
-                    forecast_grids[(substance_code, target_hour)] = forecast_grid
+                if forecast_grid.empty:
+                    break
+                previous_grid = forecast_grid
+                forecast_grids[(substance_code, target_hour)] = forecast_grid
+                if target_hour >= retention_start:
                     counts["forecast"] += _replace_grid(
                         connection,
                         substance_code,

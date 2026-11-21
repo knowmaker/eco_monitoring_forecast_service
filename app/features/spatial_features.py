@@ -55,6 +55,21 @@ def add_spatial_features(frame: pd.DataFrame, target_substance: str) -> pd.DataF
         .drop_duplicates("monitoring_post_id")
         .set_index("monitoring_post_id")
     )
+    locations = {
+        int(post_id): (float(location.latitude), float(location.longitude))
+        for post_id, location in post_locations.iterrows()
+        if np.isfinite(location.latitude) and np.isfinite(location.longitude)
+    }
+    geometry = {
+        target_id: [
+            (neighbor_id, *_distance_and_bearing(*target, *neighbor))
+            for neighbor_id, neighbor in locations.items()
+            if neighbor_id != target_id
+        ]
+        for target_id, target in locations.items()
+    }
+    lag_deltas = [pd.Timedelta(hours=hour) for hour in range(4)]
+    influence_meters = get_settings().MAX_OBSERVATION_INFLUENCE_METERS
 
     calculated: list[dict[str, float]] = []
     for row in result.itertuples(index=False):
@@ -69,32 +84,23 @@ def add_spatial_features(frame: pd.DataFrame, target_substance: str) -> pd.DataF
         trajectory_values: list[tuple[float, float, float, float, float]] = []
 
         if all(np.isfinite(item) for item in (wind_direction, wind_speed, target_latitude, target_longitude)):
-            for neighbor_id, location in post_locations.iterrows():
-                neighbor_id = int(neighbor_id)
-                if neighbor_id == target_id or not np.isfinite(location.latitude) or not np.isfinite(location.longitude):
-                    continue
-                distance_km, bearing_to_neighbor = _distance_and_bearing(
-                    float(target_latitude),
-                    float(target_longitude),
-                    float(location.latitude),
-                    float(location.longitude),
-                )
+            for neighbor_id, distance_km, bearing_to_neighbor in geometry[target_id]:
                 alignment = _angular_alignment(float(wind_direction), bearing_to_neighbor)
                 if alignment <= 0:
                     continue
                 travel_hours = distance_km / max(float(wind_speed) * 3.6, 0.1)
                 lag_hours = int(np.clip(round(travel_hours), 0, 3))
-                value = lookup.get((neighbor_id, row.source_bucket - pd.Timedelta(hours=lag_hours)))
+                value = lookup.get((neighbor_id, row.source_bucket - lag_deltas[lag_hours]))
                 if value is None or not np.isfinite(value):
                     continue
                 weight = alignment * exp(-distance_km / 20.0)
                 values.append(float(value))
                 weighted_values.append((float(value), weight))
                 distances.append(distance_km)
-                if distance_km * 1000.0 <= get_settings().MAX_OBSERVATION_INFLUENCE_METERS:
+                if distance_km * 1000.0 <= influence_meters:
                     trajectory_weight = alignment * exp(
                         -0.5
-                        * (distance_km * 1000.0 / get_settings().MAX_OBSERVATION_INFLUENCE_METERS) ** 2
+                        * (distance_km * 1000.0 / influence_meters) ** 2
                     )
                     trajectory_values.append(
                         (float(value), trajectory_weight, distance_km, travel_hours, alignment)

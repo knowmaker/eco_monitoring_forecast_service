@@ -4,15 +4,17 @@ from datetime import datetime
 
 import pandas as pd
 
-from app.config import get_settings
+from app.config import EXCLUDED_FORECAST_POST_IDS, get_settings
 from app.db import db_connection
+from app.features.horizons import FORECAST_HORIZONS, expand_horizons
 from app.features.local_features import inference_rows_for_cutoff
 from app.features.physical_baseline import add_physical_baseline
 from app.features.spatial_features import add_spatial_features
+from app.features.weather_features import load_hourly_weather
 from app.inference.store import (
-    mark_rows,
+    remove_predictions_for_excluded_posts,
     remove_predictions_without_latest_measurement,
-    set_prediction_status,
+    store_prediction_rows,
 )
 from app.models.base import deserialize_artifact, prediction_results
 from app.training.model_store import get_current_model
@@ -33,47 +35,53 @@ def _eligible_prediction_rows(
 
 
 def predict_all_stations(cutoff: datetime) -> dict[str, int]:
-    """Run the single current model for every gas/station row in one batch."""
+    """Forecast all available gases and target hours from one data cutoff."""
     counts = {substance_code: 0 for substance_code in get_settings().active_gases}
     with db_connection() as connection:
+        model = get_current_model(connection)
+        if model is None:
+            raise RuntimeError("No current forecast model in the database")
+        artifact = deserialize_artifact(model["artifact"])
+        if artifact.metadata.get("model_type") != "per_gas_five_hour":
+            raise ValueError("The current model does not support gas-specific five-hour forecasts")
+        horizons = FORECAST_HORIZONS
+        target_weather = load_hourly_weather(
+            connection, cutoff, cutoff + pd.Timedelta(hours=max(horizons)),
+            data_kind="live_forecast",
+        )
+        excluded = EXCLUDED_FORECAST_POST_IDS
+        remove_predictions_for_excluded_posts(connection, cutoff, excluded, horizons=horizons)
         frames: list[pd.DataFrame] = []
         for substance_code in get_settings().active_gases:
-            remove_predictions_without_latest_measurement(connection, substance_code, cutoff)
-            history = add_physical_baseline(
-                add_spatial_features(
-                    inference_rows_for_cutoff(connection, substance_code, cutoff), substance_code
-                )
+            remove_predictions_without_latest_measurement(
+                connection, substance_code, cutoff, horizons=horizons,
+            )
+            history = add_spatial_features(
+                inference_rows_for_cutoff(
+                    connection, substance_code, cutoff, exclude_post_ids=excluded,
+                ), substance_code,
             )
             rows = _eligible_prediction_rows(history, substance_code, cutoff)
             if not rows.empty:
+                rows = expand_horizons(
+                    rows, target_weather, horizons=horizons, include_target=False,
+                )
+                rows = add_physical_baseline(rows)
                 frames.append(rows)
         if not frames:
             return counts
 
         rows = pd.concat(frames, ignore_index=True, sort=False)
-        mark_rows(connection, rows, "running")
-        model = get_current_model(connection)
-        if model is None:
-            mark_rows(connection, rows, "unavailable", "Обученная модель отсутствует.")
-            return counts
         try:
-            artifact = deserialize_artifact(model["artifact"])
             prepared = rows.copy()
             prepared["substance_code"] = prepared["substance_code"].astype(str)
             results = prediction_results(artifact, prepared)
-            for row, result in zip(rows.itertuples(index=False), results, strict=True):
-                substance_code = str(row.substance_code)
-                set_prediction_status(
-                    connection,
-                    monitoring_post_id=int(row.monitoring_post_id),
-                    substance_code=substance_code,
-                    data_cutoff=row.data_cutoff.to_pydatetime(),
-                    target_start=row.target_start.to_pydatetime(),
-                    target_end=row.target_end.to_pydatetime(),
-                    status="ready",
-                    result=result,
-                )
-                counts[substance_code] += 1
+            store_prediction_rows(connection, rows, "ready", results)
+            for substance_code, count in rows["substance_code"].value_counts().items():
+                counts[str(substance_code)] = int(count)
         except Exception as error:
-            mark_rows(connection, rows, "failed", str(error))
+            connection.rollback()
+            store_prediction_rows(connection, rows, "failed", error_message=str(error))
+            connection.commit()
+            raise
         return counts

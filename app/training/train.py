@@ -1,148 +1,147 @@
+"""Fit one residual CatBoost estimator per gas for five target hours."""
+
 from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 
-from app.config import get_settings
+from app.config import EXCLUDED_FORECAST_POST_IDS, get_settings
 from app.db import db_connection
+from app.features.horizons import FORECAST_HORIZONS, expand_horizons
 from app.features.local_features import build_local_frame, feature_columns
 from app.features.physical_baseline import add_physical_baseline
 from app.features.spatial_features import add_spatial_features
+from app.features.weather_features import load_hourly_weather
 from app.models.base import ModelArtifact, serialize_artifact
-from app.models.spatial import create_estimator
-from app.training.backtest import chronological_split, regression_metrics, residual_interval
-from app.training.model_store import get_current_model, replace_current_model
+from app.models.spatial import PerGasEstimator, create_estimator
+from app.training.backtest import regression_metrics, residual_interval
+from app.training.model_store import replace_current_model
 
 
-def _training_frame(connection, *, history_start=None, history_end=None) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-    for substance_code in get_settings().active_gases:
-        frame = add_physical_baseline(
-            add_spatial_features(
-                build_local_frame(
-                    connection,
-                    substance_code,
-                    include_target=True,
-                    history_start=history_start,
-                    history_end=history_end,
-                ), substance_code
-            )
-        )
-        frame["correction_target"] = frame["target_value"] - frame["physical_baseline"]
-        frames.append(frame.dropna(subset=["target_value"]))
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True, sort=False).sort_values("target_start").reset_index(drop=True)
-
-
-def _should_activate(
-    current_model: dict[str, object] | None,
-    candidate_metrics: dict[str, object],
-) -> tuple[bool, str]:
-    if current_model is None:
-        return True, "initial_model"
-    candidate_mae = float(candidate_metrics["overall"]["mae"])
-    current_mae = float(current_model["metrics"]["overall"]["mae"])
-    if candidate_mae <= current_mae:
-        return True, "quality_not_worse"
-    return False, "candidate_mae_is_worse"
+def _score_holdout(frame: pd.DataFrame, predictions: np.ndarray, gas: str) -> dict:
+    physical = frame["physical_baseline"].to_numpy(float)
+    persistence = frame[f"gas_{gas}_lag_0"].to_numpy(float)
+    scores: dict[str, object] = {}
+    for horizon in FORECAST_HORIZONS:
+        mask = frame["horizon_hours"].eq(horizon).to_numpy()
+        actual = frame.loc[mask, "target_value"]
+        scores[str(horizon)] = {
+            "rows": int(mask.sum()),
+            "model": regression_metrics(actual, predictions[mask]),
+            "physical_only": regression_metrics(actual, physical[mask]),
+            "persistence": regression_metrics(actual, persistence[mask]),
+        }
+    return scores
 
 
 def train_and_replace() -> dict[str, object]:
     settings = get_settings()
-    with db_connection() as connection:
-        current_model = get_current_model(connection)
-        clean = _training_frame(connection)
-        if len(clean) < settings.MIN_TRAIN_ROWS:
-            raise ValueError(f"{len(clean)} training rows; at least {settings.MIN_TRAIN_ROWS} required.")
+    end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=settings.TRAIN_HISTORY_DAYS)
+    holdout_start = end - timedelta(days=settings.TRAIN_HOLDOUT_DAYS)
+    if holdout_start <= start + timedelta(days=1):
+        raise ValueError("Holdout period leaves no useful training interval")
 
-        columns = feature_columns(clean, include_post_id=False) + ["substance_code"]
-        categorical = ["substance_code"]
-        clean["substance_code"] = clean["substance_code"].astype(str)
-        split = chronological_split(clean, settings.TEST_FRACTION)
+    models = {}
+    columns = None
+    metrics = {"holdout_start_utc": holdout_start.isoformat(), "by_gas": {}}
+    intervals = {}
+    rows_count = 0
+    first_target = None
+    last_target = None
 
-        estimator = create_estimator(categorical)
-        estimator.fit(split.train[columns], split.train["correction_target"])
-        correction = estimator.predict(split.test[columns])
-        predicted = split.test["physical_baseline"].to_numpy(dtype=float) + correction
-        predicted = predicted.clip(min=0.0)
-        persistence = np.asarray([
-            row.get(f"gas_{row['substance_code']}_lag_0", np.nan)
-            for _, row in split.test.iterrows()
-        ], dtype=float)
-        metrics: dict[str, object] = {
-            "overall": regression_metrics(split.test["target_value"], predicted),
-            "test_rows": len(split.test),
-            "by_gas": {},
-            "by_station": {},
-            "baselines": {
-                "physical_only": regression_metrics(
-                    split.test["target_value"],
-                    split.test["physical_baseline"].to_numpy(dtype=float),
-                ),
-                "persistence": regression_metrics(split.test["target_value"], persistence),
-            },
-        }
-        residual_intervals: dict[str, dict[str, float]] = {}
-        for substance_code in settings.active_gases:
-            mask = split.test["substance_code"] == substance_code
-            if not mask.any():
-                continue
-            actual = split.test.loc[mask, "target_value"]
-            gas_predicted = predicted[mask.to_numpy()]
-            metrics["by_gas"][substance_code] = regression_metrics(actual, gas_predicted)
-            lower, upper = residual_interval(actual, gas_predicted)
-            residual_intervals[substance_code] = {"lower": lower, "upper": upper}
+    with db_connection(readonly=True) as connection:
+        weather = load_hourly_weather(
+            connection, start, end + timedelta(hours=max(FORECAST_HORIZONS)),
+            data_kind="historical_forecast",
+        )
+        for gas in settings.active_gases:
+            source = build_local_frame(
+                connection, gas, include_target=True,
+                history_start=start, history_end=end,
+                exclude_post_ids=EXCLUDED_FORECAST_POST_IDS,
+            )
+            if source.empty:
+                raise ValueError(f"No eligible source measurements for {gas}")
+            source = add_spatial_features(source, gas)
+            frame = add_physical_baseline(
+                expand_horizons(source, weather, include_target=True)
+            )
+            frame = frame.dropna(subset=["target_value", "physical_baseline"])
+            frame = frame[
+                (frame["target_start"] >= pd.Timestamp(start))
+                & (frame["target_start"] < pd.Timestamp(end))
+            ].copy()
+            if frame.empty:
+                raise ValueError(f"No training targets for {gas}")
+            train = frame[frame["target_start"] < pd.Timestamp(holdout_start)]
+            test = frame[frame["target_start"] >= pd.Timestamp(holdout_start)]
+            if len(train) < settings.MIN_TRAIN_ROWS or len(test) < settings.MIN_TRAIN_ROWS:
+                raise ValueError(f"Insufficient train or holdout rows for {gas}")
 
-        for monitoring_post_id in sorted(split.test["monitoring_post_id"].unique()):
-            mask = split.test["monitoring_post_id"] == monitoring_post_id
-            if mask.any():
-                metrics["by_station"][str(monitoring_post_id)] = regression_metrics(
-                    split.test.loc[mask, "target_value"], predicted[mask.to_numpy()]
-                )
+            gas_columns = [
+                name for name in feature_columns(frame, include_post_id=False)
+                if name != "substance_code"
+            ]
+            if columns is None:
+                columns = gas_columns
+            elif gas_columns != columns:
+                raise ValueError(f"Feature columns differ for {gas}")
 
-        activated, activation_reason = _should_activate(current_model, metrics)
-        if not activated:
-            return {
-                "rows": len(clean),
-                "metrics": metrics,
-                "activated": False,
-                "activation_reason": activation_reason,
+            candidate = create_estimator()
+            candidate.fit(
+                train[columns], train["target_value"] - train["physical_baseline"]
+            )
+            prediction = np.maximum(
+                test["physical_baseline"].to_numpy(float)
+                + candidate.predict(test[columns]), 0.0,
+            )
+            metrics["by_gas"][gas] = {
+                "train_rows": len(train), "holdout_rows": len(test),
+                "by_horizon": _score_holdout(test, prediction, gas),
             }
+            low, high = residual_interval(test["target_value"], prediction)
+            intervals[gas] = {"lower": low, "upper": high}
 
-        final_estimator = create_estimator(categorical)
-        final_estimator.fit(clean[columns], clean["correction_target"])
-        artifact = ModelArtifact(
-            estimator=final_estimator,
-            feature_columns=columns,
-            categorical_features=categorical,
-            residual_lower=None,
-            residual_upper=None,
-            metadata={
-                "metrics": metrics,
-                "residual_intervals": residual_intervals,
-                "prediction_mode": "physical_residual",
-                "active_gases": list(settings.active_gases),
-                "spatial_analysis": "anisotropic_optimal_interpolation",
-            },
-        )
+            final = create_estimator()
+            final.fit(frame[columns], frame["target_value"] - frame["physical_baseline"])
+            models[gas] = final
+            rows_count += len(frame)
+            first = frame["target_start"].min()
+            last = frame["target_start"].max()
+            first_target = first if first_target is None else min(first_target, first)
+            last_target = last if last_target is None else max(last_target, last)
+
+    if columns is None or first_target is None or last_target is None:
+        raise ValueError("No forecast models were trained")
+    artifact = ModelArtifact(
+        estimator=PerGasEstimator(models, columns),
+        feature_columns=[*columns, "substance_code"],
+        categorical_features=["substance_code"],
+        residual_lower=None, residual_upper=None,
+        metadata={
+            "model_type": "per_gas_five_hour",
+            "prediction_mode": "physical_residual",
+            "active_gases": list(settings.active_gases),
+            "forecast_horizons": list(FORECAST_HORIZONS),
+            "excluded_training_post_ids": sorted(EXCLUDED_FORECAST_POST_IDS),
+            "residual_intervals": intervals,
+            "train_end_utc": last_target.isoformat(),
+        },
+    )
+    with db_connection() as connection:
         replace_current_model(
-            connection,
-            artifact=serialize_artifact(artifact),
-            feature_columns=columns,
-            categorical_features=categorical,
-            train_start=clean["target_start"].min().to_pydatetime(),
-            train_end=clean["target_start"].max().to_pydatetime(),
-            rows_count=len(clean),
-            metrics=metrics,
-            residual_intervals=residual_intervals,
+            connection, artifact=serialize_artifact(artifact),
+            feature_columns=artifact.feature_columns,
+            categorical_features=artifact.categorical_features,
+            train_start=first_target.to_pydatetime(),
+            train_end=last_target.to_pydatetime(),
+            rows_count=rows_count, metrics=metrics,
+            residual_intervals=intervals,
         )
-        return {
-            "rows": len(clean),
-            "metrics": metrics,
-            "activated": True,
-            "activation_reason": activation_reason,
-        }
+    return {"rows_count": rows_count, "metrics": metrics}
 
 
 def main() -> None:

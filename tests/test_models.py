@@ -2,11 +2,46 @@ import pandas as pd
 
 from app.features.spatial_features import add_spatial_features
 from app.models.base import ModelArtifact, prediction_results
+from app.models.spatial import PerGasEstimator
 
 
 class ConstantEstimator:
     def predict(self, frame):
         return [-0.5, 1.5][: len(frame)]
+
+
+class HorizonEstimator:
+    def __init__(self, offset):
+        self.offset = offset
+
+    def predict(self, frame):
+        return frame["horizon_hours"].to_numpy() + self.offset
+
+
+def test_per_gas_estimator_routes_each_horizon_to_the_correct_model():
+    estimator = PerGasEstimator(
+        {"CO": HorizonEstimator(10), "NO2": HorizonEstimator(20)},
+        ["horizon_hours"],
+    )
+    frame = pd.DataFrame({
+        "substance_code": ["NO2", "CO", "NO2", "CO"],
+        "horizon_hours": [1, 2, 5, 3],
+    })
+    assert estimator.predict(frame).tolist() == [21, 12, 25, 13]
+
+
+def test_five_hour_artifact_adds_the_physical_baseline():
+    artifact = ModelArtifact(
+        PerGasEstimator({"NO2": HorizonEstimator(0)}, ["horizon_hours"]),
+        ["horizon_hours", "substance_code"], ["substance_code"], None, None,
+        {"prediction_mode": "physical_residual"},
+    )
+    frame = pd.DataFrame({
+        "substance_code": ["NO2", "NO2"],
+        "horizon_hours": [1, 5],
+        "physical_baseline": [10, 20],
+    })
+    assert [item.value for item in prediction_results(artifact, frame)] == [11, 25]
 
 
 def test_prediction_results_do_not_return_negative_concentrations():
